@@ -1,0 +1,125 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-docai}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-change-me}
+      POSTGRES_DB: ${POSTGRES_DB:-document_clean_reconstruct}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "${POSTGRES_HOST_PORT:-5432}:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-docai}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "${REDIS_HOST_PORT:-6379}:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  backend:
+    build:
+      context: .
+      dockerfile: docker/backend/Dockerfile
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-docai}:${POSTGRES_PASSWORD:-change-me}@postgres:5432/${POSTGRES_DB:-document_clean_reconstruct}
+      REDIS_URL: redis://redis:6379/0
+      CELERY_BROKER_URL: redis://redis:6379/0
+      CELERY_RESULT_BACKEND: redis://redis:6379/1
+      STORAGE_LOCAL_ROOT: /app/storage
+    volumes:
+      - ./backend:/app/backend
+      - storage_data:/app/storage
+      - paddleocr_models:/root/.paddleocr
+    ports:
+      - "${BACKEND_HOST_PORT:-8000}:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    command: >
+      sh -c "alembic upgrade head && uvicorn main:app --host 0.0.0.0 --port 8000 --reload"
+
+  worker:
+    build:
+      context: .
+      dockerfile: docker/backend/Dockerfile
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-docai}:${POSTGRES_PASSWORD:-change-me}@postgres:5432/${POSTGRES_DB:-document_clean_reconstruct}
+      REDIS_URL: redis://redis:6379/0
+      CELERY_BROKER_URL: redis://redis:6379/0
+      CELERY_RESULT_BACKEND: redis://redis:6379/1
+      STORAGE_LOCAL_ROOT: /app/storage
+    volumes:
+      - ./backend:/app/backend
+      - storage_data:/app/storage
+      - paddleocr_models:/root/.paddleocr
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      backend:
+        condition: service_started
+    command: celery -A app.core.celery_app worker -l info --concurrency=${CELERY_WORKER_CONCURRENCY:-2}
+
+  frontend:
+    build:
+      context: .
+      dockerfile: docker/frontend/Dockerfile
+    environment:
+      # Must match nginx's actual host port (NGINX_HOST_PORT below, default
+      # 80) -- these were previously hardcoded to plain "localhost" (port
+      # 80), which broke every request with ERR_CONNECTION_REFUSED as soon
+      # as NGINX_HOST_PORT was remapped to something else (e.g. 8080 to
+      # dodge a port conflict) without updating this to match.
+      VITE_API_BASE_URL: http://localhost:${NGINX_HOST_PORT:-80}/api
+      VITE_WS_BASE_URL: ws://localhost:${NGINX_HOST_PORT:-80}/ws
+    volumes:
+      - ./frontend:/app/frontend
+      - /app/frontend/node_modules
+    ports:
+      - "${FRONTEND_HOST_PORT:-5173}:5173"
+    depends_on:
+      - backend
+
+  nginx:
+    image: nginx:1.27-alpine
+    volumes:
+      - ./docker/nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+    ports:
+      - "${NGINX_HOST_PORT:-80}:80"
+    depends_on:
+      - backend
+      - frontend
+
+  # Optional local LLM for layout/structure suggestions (spec section 27).
+  # Not required — the app runs fully without it (OLLAMA_BASE_URL simply
+  # won't be reachable and every Ollama call degrades to "no suggestion").
+  ollama:
+    image: ollama/ollama:latest
+    profiles: ["ollama"]
+    volumes:
+      - ollama_data:/root/.ollama
+    ports:
+      - "${OLLAMA_HOST_PORT:-11434}:11434"
+
+volumes:
+  postgres_data:
+  storage_data:
+  ollama_data:
+  # PaddleOCR downloads its detection/recognition/table-structure model
+  # weights on first use; persisting this avoids re-downloading them every
+  # time the backend/worker containers are recreated.
+  paddleocr_models:

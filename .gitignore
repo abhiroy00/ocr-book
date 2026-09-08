@@ -1,0 +1,51 @@
+# Env
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+backend/.venv/
+
+# Node
+node_modules/
+frontend/dist/
+frontend/.vite/
+npm-debug.log*
+
+# Storage (runtime data, never commit)
+storage/original/*
+storage/pages/*
+storage/processed/*
+storage/ocr/*
+storage/output/*
+storage/tmp/*
+!storage/**/.gitkeep
+
+# OCR / model caches
+.paddleocr/
+**/.paddlex/
+
+# Fetched fonts (backend/scripts/fetch_fonts.sh) — not committed, needed on
+# the host because docker-compose's bind mount shadows whatever the
+# Dockerfile downloaded at image build time; see that script's header.
+backend/app/reconstruction/fonts/*.ttf
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+logs/
+
+# Docker
+docker/**/*.pyc
