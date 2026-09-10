@@ -27,14 +27,33 @@ _engine_lock = threading.Lock()
 
 def _get_paddle_engine(lang: str):
     """Lazily instantiate (and cache) one PaddleOCR() per language — model
-    loading is expensive, so this must happen once per worker process."""
+    loading is expensive, so this must happen once per worker process.
+
+    `cpu_threads=1` is deliberate, not an oversight: PaddleOCR's own default
+    is `cpu_threads=10` (it calls `config.set_cpu_math_library_num_threads`
+    internally), which is only correct when a single PaddleOCR instance
+    owns the whole machine. This engine now regularly runs inside one of
+    several `app.workers.page_worker_pool` worker *processes* running at
+    once -- with the library default, N pool workers each spun up their
+    own internal 10-thread MKL/OpenBLAS pool, oversubscribing the CPU by
+    up to Nx10 threads competing for the host's actual core count. This
+    was confirmed as a real, severe production regression: with 2 pool
+    workers at the library default, per-page OCR time degraded from ~4s to
+    over 1150s (nearly 20 minutes) for a single page after a few pages,
+    with PaddlePaddle's own internal scheduler logging "bvar is busy at
+    sampling" -- a symptom of exactly this thread thrashing. Pinning each
+    instance to 1 internal thread makes the pool's own process-level
+    parallelism (one process per `OCR_WORKERS`) the sole source of
+    concurrency, which is the correct place for it: no oversubscription is
+    possible regardless of how many pool workers are configured.
+    """
     with _engine_lock:
         if lang not in _engine_cache:
             try:
                 from paddleocr import PaddleOCR
             except ImportError as exc:  # pragma: no cover - environment dependent
                 raise OCREngineUnavailableError(f"paddleocr package not installed: {exc}") from exc
-            _engine_cache[lang] = PaddleOCR(use_angle_cls=True, lang=lang, show_log=False)
+            _engine_cache[lang] = PaddleOCR(use_angle_cls=True, lang=lang, show_log=False, cpu_threads=1)
         return _engine_cache[lang]
 
 

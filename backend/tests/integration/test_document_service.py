@@ -4,8 +4,14 @@ Integration tests for the document persistence service against a real
 persistence -> Document JSON assembly, without requiring Postgres/Redis/
 Celery/PaddleOCR to be running (see docker-compose for the full stack).
 """
+from datetime import datetime, timedelta, timezone
+from unittest.mock import MagicMock, patch
+
+from sqlalchemy import update
+
 from app.layout.detector import LayoutBlockResult
 from app.models.enums import DocumentStatus, LayoutBlockType, OCRProviderEnum, PreprocessProfileEnum, TableDetectionMethod, TextAlign
+from app.models.processing_job import ProcessingJob
 from app.schemas.geometry import BBox, Polygon
 from app.schemas.ocr import OCRWordResult
 from app.services import document_service
@@ -104,3 +110,69 @@ def test_update_table_cell_marks_edited(test_db_session, tmp_storage, sample_png
     updated = document_service.update_table_cell(test_db_session, cell.id, text="16.5*")
     assert updated.is_edited is True
     assert updated.text == "16.5*"
+
+
+def _backdate_job(db, job, seconds_ago: int) -> None:
+    """Bypass the ORM's onupdate=utcnow on `updated_at` (a raw Core UPDATE,
+    unlike an ORM-flushed change, doesn't trigger it) so tests can simulate
+    a job that's genuinely been sitting untouched for a while."""
+    old = datetime.now(timezone.utc) - timedelta(seconds=seconds_ago)
+    db.execute(update(ProcessingJob).where(ProcessingJob.id == job.id).values(updated_at=old))
+    db.commit()
+    db.refresh(job)
+
+
+def _make_active_job(test_db_session, tmp_storage, sample_png_bytes):
+    document, job = document_service.create_document_from_upload(
+        test_db_session, tmp_storage, "a.png", sample_png_bytes, OCRProviderEnum.PADDLEOCR, 300, PreprocessProfileEnum.BALANCED
+    )
+    job.status = DocumentStatus.OCR_PROCESSING
+    test_db_session.commit()
+    return document, job
+
+
+def test_detect_and_fail_stale_job_leaves_recently_updated_job_alone(test_db_session, tmp_storage, sample_png_bytes):
+    _, job = _make_active_job(test_db_session, tmp_storage, sample_png_bytes)
+    result = document_service.detect_and_fail_stale_job(test_db_session, job)
+    assert result.status == DocumentStatus.OCR_PROCESSING
+
+
+def test_detect_and_fail_stale_job_leaves_queued_job_alone_even_if_old(test_db_session, tmp_storage, sample_png_bytes):
+    """A QUEUED job has never acquired the lock yet -- that's normal, not stale."""
+    document, job = document_service.create_document_from_upload(
+        test_db_session, tmp_storage, "a.png", sample_png_bytes, OCRProviderEnum.PADDLEOCR, 300, PreprocessProfileEnum.BALANCED
+    )
+    _backdate_job(test_db_session, job, seconds_ago=3600)
+    result = document_service.detect_and_fail_stale_job(test_db_session, job)
+    assert result.status == DocumentStatus.QUEUED
+
+
+def test_detect_and_fail_stale_job_leaves_active_job_alone_when_lock_still_held(test_db_session, tmp_storage, sample_png_bytes):
+    _, job = _make_active_job(test_db_session, tmp_storage, sample_png_bytes)
+    _backdate_job(test_db_session, job, seconds_ago=1000)
+
+    fake_client = MagicMock()
+    fake_client.exists.return_value = 1
+    with patch("redis.Redis.from_url", return_value=fake_client):
+        result = document_service.detect_and_fail_stale_job(test_db_session, job)
+
+    assert result.status == DocumentStatus.OCR_PROCESSING
+
+
+def test_detect_and_fail_stale_job_fails_job_when_lock_gone(test_db_session, tmp_storage, sample_png_bytes):
+    """Regression test for a real incident: a worker was killed mid-task by
+    a container restart, and the document sat reporting OCR_PROCESSING for
+    57+ minutes with no active Celery task and no Redis lock -- silently
+    unrecoverable without this check."""
+    document, job = _make_active_job(test_db_session, tmp_storage, sample_png_bytes)
+    _backdate_job(test_db_session, job, seconds_ago=1000)
+
+    fake_client = MagicMock()
+    fake_client.exists.return_value = 0
+    with patch("redis.Redis.from_url", return_value=fake_client):
+        result = document_service.detect_and_fail_stale_job(test_db_session, job)
+
+    assert result.status == DocumentStatus.FAILED
+    assert "stalled" in result.error_message.lower()
+    test_db_session.refresh(document)
+    assert document.status == DocumentStatus.FAILED

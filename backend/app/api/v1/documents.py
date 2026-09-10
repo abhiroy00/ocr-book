@@ -128,6 +128,7 @@ def get_progress(document_id: str, db: Session = Depends(get_db)):
     )
     if job is None:
         raise HTTPException(status_code=404, detail="No processing job found for this document")
+    job = document_service.detect_and_fail_stale_job(db, job)
     return ProcessingJobRead.model_validate(job)
 
 

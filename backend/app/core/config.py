@@ -94,7 +94,24 @@ class Settings(BaseSettings):
 
     # --- Workers ---
     celery_worker_concurrency: int = 4
-    page_parallelism: int = 4
+
+    # --- Page-level OCR parallelism (controlled worker pool, not one
+    # process per page -- see app.workers.page_worker_pool) ---
+    # 0 means "pick a sensible default from CPU count at pipeline start"
+    # (see Settings.resolved_ocr_workers) rather than hardcoding a number
+    # here that would be wrong on both a 2-core laptop and a 32-core
+    # server. PaddleOCR/OpenCV work is CPU-bound native code with no GIL
+    # release, so this pool is process-based, not thread-based -- each
+    # worker's memory cost (a loaded OCR model) is real, so this must stay
+    # a deliberate, bounded number, never one-per-page.
+    ocr_workers: int = 0
+    # Independent, much smaller concurrency cap for NVIDIA AI-fallback
+    # calls specifically -- normal OCR parallelism (OCR_WORKERS) must not
+    # translate into that many simultaneous external API requests.
+    max_ai_concurrency: int = 2
+    ocr_queue_size: int = 0  # 0 = unbounded (page numbers are cheap; no reason to block submission)
+    ocr_task_timeout_seconds: int = 180
+    ocr_retry_count: int = 2
 
     @field_validator("allowed_upload_extensions")
     @classmethod
@@ -116,6 +133,28 @@ class Settings(BaseSettings):
     @property
     def paddle_ocr_lang_list(self) -> List[str]:
         return [l.strip() for l in self.paddle_ocr_langs.split(",") if l.strip()]
+
+    @property
+    def resolved_ocr_workers(self) -> int:
+        """`OCR_WORKERS=0` (the default) picks a bounded, CPU-aware worker
+        count instead of a hardcoded number: half the available cores
+        (rounded down), capped to [1, 6]. Reasoning: each worker is a
+        separate OS process holding its own loaded OCR model (real RAM
+        cost, not just CPU time), so "use every core" would both starve
+        the rest of the container (DB, web server, other concurrent
+        Celery tasks under celery_worker_concurrency) and multiply memory
+        use for a resource this codebase has already had crash/instability
+        problems from under sustained load (see docs/PHASES.md). Half the
+        cores leaves headroom for that contention; 6 is a practical
+        ceiling for CPU-bound OCR because thread/process scheduling
+        overhead and memory bandwidth contention erode the marginal
+        benefit well before most machines' full core count."""
+        if self.ocr_workers > 0:
+            return self.ocr_workers
+        import os
+
+        cpu_count = os.cpu_count() or 2
+        return max(1, min(6, cpu_count // 2))
 
 
 @lru_cache

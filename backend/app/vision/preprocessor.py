@@ -38,31 +38,72 @@ class PreprocessResult:
 
 _ROTATION_MARGIN_RATIO = 0.15  # a candidate orientation must beat 0deg by this much (relatively) to be chosen
 
+# Coarse 90/180/270 auto-rotation is disabled by default -- see
+# `detect_rotation`'s docstring for the real-production evidence behind
+# this. Flip to True only for a document corpus you have separately
+# verified doesn't trigger the same false-positive pattern (e.g. plain
+# prose with no ruled tables), and even then treat it as experimental.
+ENABLE_COARSE_ROTATION_DETECTION = False
+
+
+def _score_rotation_candidates(binary: np.ndarray) -> dict[int, float]:
+    """Row-sum variance for each of the 4 axis-aligned orientations of a
+    THRESH_BINARY_INV mask (ink=255, background=0). `border_value=0` is
+    required here: the default border_value=255 would fill the
+    corner-expansion padding a 90/270-degree rotation introduces with fake
+    "ink", creating a solid full-width/full-height border streak that
+    dominates the real signal (confirmed as the cause of a 258/446 false
+    -positive rate on real data before this was fixed)."""
+    scores: dict[int, float] = {}
+    for angle in (0, 90, 180, 270):
+        rotated = _rotate_bound(binary, angle, border_value=0)
+        row_sums = rotated.sum(axis=1)
+        scores[angle] = float(np.var(row_sums))
+    return scores
+
 
 def detect_rotation(image: np.ndarray) -> float:
     """Coarse page-orientation detection (0/90/180/270) via text-line profile.
 
-    Uses the projection-profile variance heuristic: horizontal text lines
-    create sharp peaks/troughs in the row-wise ink-density profile, so the
-    upright (or 90-degree-off) orientation scores much higher than a
-    sideways one. This reliably distinguishes 0/90 vs 180/270 -- but
-    variance is symmetric under reversal, so it CANNOT distinguish 0 from
-    180 (an upside-down page has the exact same row-sum multiset, just in
-    reverse order, hence near-identical variance). Rather than guess on
-    that ~50/50 toss-up and randomly flip a normal upright page, a
-    candidate orientation is only accepted if it beats the 0-degree score
-    by a clear margin; ties stay at 0. Genuinely upside-down real-world
-    scans are a known limitation (see README) -- catching those reliably
-    needs an OCR-confidence-based check, not a pixel-projection heuristic.
+    DISABLED BY DEFAULT (returns 0.0 unconditionally unless
+    `ENABLE_COARSE_ROTATION_DETECTION` is flipped on). This was originally a
+    projection-profile variance heuristic: horizontal text lines create
+    sharp peaks/troughs in the row-wise ink-density profile, so the upright
+    orientation was expected to score higher than a sideways one.
+
+    Verified against a real 446-page scanned government document (dense
+    ruled statistical tables, mixed Hindi/English, 150 DPI): even after
+    fixing an unrelated border-padding bug that made it worse (258/446
+    pages wrongly flagged), the heuristic still produced false positives
+    with no clean score threshold separating them from genuine rotations
+    -- spot-checking pages across the full confidence range, INCLUDING the
+    two most "confident" outliers (56x and 8x the baseline score), found
+    every single one to be a normal upright page. Zero genuine rotations
+    were found anywhere in the document. Long unbroken table ruling lines
+    (common in this kind of content) concentrate ink into a few rows/
+    columns in a way that mimics or exceeds the signal genuine sideways
+    text produces, so no margin threshold can safely separate the two for
+    this class of document.
+
+    Because a false-positive flip actively destroys correct OCR content
+    (turns a readable page into garbage) while a missed genuine rotation
+    merely leaves that one page's OCR confidence low (recoverable, visible
+    in the quality report), the safe default is to not auto-rotate at all.
+    Fine-grained deskew (`deskew_image`, capped at +-20 degrees) is
+    unaffected and still runs -- it corrects the small skew angles typical
+    of flatbed scanning without ever attempting a 90-degree-class flip.
+    Genuinely sideways/upside-down scans remain a known limitation (see
+    README); reliably catching those needs an OCR-confidence-based check
+    (actually run OCR at each candidate angle and compare confidence),
+    not a pixel-projection heuristic -- which is a meaningfully more
+    expensive per-page cost this codebase has not yet opted into.
     """
+    if not ENABLE_COARSE_ROTATION_DETECTION:
+        return 0.0
+
     gray = _to_gray(image)
     _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
-
-    scores: dict[int, float] = {}
-    for angle in (0, 90, 180, 270):
-        rotated = _rotate_bound(binary, angle)
-        row_sums = rotated.sum(axis=1)
-        scores[angle] = float(np.var(row_sums))
+    scores = _score_rotation_candidates(binary)
 
     baseline = scores[0]
     best_angle = 0.0

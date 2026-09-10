@@ -199,6 +199,85 @@ def update_job_progress(
     )
 
 
+# A job is only ever "actively running" once it has left QUEUED -- a QUEUED
+# job with no lock yet is completely normal (Celery just hasn't picked it up
+# or the task hasn't reached its lock-acquisition line yet).
+_STARTED_ACTIVE_STATUSES = {
+    DocumentStatus.PROCESSING,
+    DocumentStatus.OCR_PROCESSING,
+    DocumentStatus.LAYOUT_PROCESSING,
+    DocumentStatus.TABLE_PROCESSING,
+    DocumentStatus.RECONSTRUCTING,
+    DocumentStatus.EXPORTING,
+}
+# The pipeline's document lock (TTL 600s, renewed after every page -- see
+# `app.workers.pipeline_tasks`) is the ground truth for "is a worker still
+# actually alive on this document". Its own self-heal window is 600s; this
+# is deliberately looser so a job is never flagged mid-legitimate-renewal-
+# gap, only once it's unambiguously past even a slow page plus the lock's
+# own TTL.
+_STALE_JOB_GRACE_SECONDS = 900
+
+
+def detect_and_fail_stale_job(db: Session, job: ProcessingJob) -> ProcessingJob:
+    """Called from the progress-polling read path (not a background sweep --
+    this project has no Celery beat scheduler running, so a lazy check on
+    read is the simplest reliable way to surface this). If a job has been in
+    an active, already-started status well past the document lock's TTL and
+    that lock no longer exists, the worker that held it is gone and nothing
+    will ever advance this job again -- Celery's own broker-level redelivery
+    for a `task_acks_late` task is not guaranteed to happen promptly (default
+    Redis transport visibility_timeout is 1 hour), so without this a stuck
+    job leaves the UI showing "processing" indefinitely with no way for the
+    user to know a retry is needed. Confirmed against a real incident: a
+    7-page document's worker was killed mid-task by a container restart and
+    sat reporting OCR_PROCESSING for 57+ minutes with no active Celery task
+    anywhere and no Redis lock -- silently unrecoverable without this check.
+    """
+    if job.status not in _STARTED_ACTIVE_STATUSES:
+        return job
+    if job.updated_at is None:
+        return job
+    now = datetime.now(timezone.utc)
+    updated_at = job.updated_at if job.updated_at.tzinfo else job.updated_at.replace(tzinfo=timezone.utc)
+    age_seconds = (now - updated_at).total_seconds()
+    if age_seconds < _STALE_JOB_GRACE_SECONDS:
+        return job
+
+    import redis as redis_sync
+
+    from app.core.config import get_settings
+    from app.core.locks import DOCUMENT_LOCK_PREFIX
+
+    settings = get_settings()
+    try:
+        client = redis_sync.Redis.from_url(settings.redis_url, socket_connect_timeout=5, socket_timeout=5)
+        try:
+            lock_exists = client.exists(DOCUMENT_LOCK_PREFIX + job.document_id)
+        finally:
+            client.close()
+    except redis_sync.exceptions.RedisError:
+        # Can't tell either way right now -- don't fail a possibly-healthy
+        # job just because this particular check couldn't reach Redis.
+        return job
+
+    if lock_exists:
+        return job
+
+    update_job_progress(
+        db,
+        job,
+        job.stage,
+        job.progress_percent,
+        DocumentStatus.FAILED,
+        error=(
+            f"Processing stalled: no update for over {int(age_seconds // 60)} minutes and the worker's "
+            "processing lock is gone (the worker likely died or was restarted mid-task). Re-run to try again."
+        ),
+    )
+    return job
+
+
 # ----------------------------------------------------------------------------
 # Page + pipeline-result persistence
 # ----------------------------------------------------------------------------

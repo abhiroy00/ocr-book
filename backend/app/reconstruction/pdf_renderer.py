@@ -112,6 +112,22 @@ def _render_text(page, rect: "fitz.Rect", block: DocumentBlockJSON, body_font, b
 
 
 def _render_table(page, block: DocumentBlockJSON, page_json: PageJSON, body_font) -> None:
+    """Draws each cell's border, then its text sized to actually fit.
+
+    Real-world dense statistical tables (the kind this project's primary
+    test document is full of) routinely have row heights well under the
+    previous fixed 9pt -- confirmed on real data: several rows only 2.7-
+    10.9pt tall after the fixed 2pt inset. `insert_textbox` does not raise
+    when text can't fit vertically at the given size; it silently inserts
+    nothing and returns a negative remainder. Because that return value was
+    never checked here (unlike `_render_text`, which already retries at a
+    smaller size), every cell in a table with any short row silently lost
+    its text in the exported PDF -- while its (now text-less) border
+    rectangle was still drawn unconditionally just above, since that call
+    doesn't depend on the text fitting. This produced exactly the
+    "empty grid of boxes" defect confirmed by rendering a real exported
+    page and reading it back with `get_text()`.
+    """
     table = block.table
     dpi = page_json.dpi
 
@@ -122,16 +138,39 @@ def _render_table(page, block: DocumentBlockJSON, page_json: PageJSON, body_font
                 px_to_pt(cell.bbox.x2, dpi), px_to_pt(cell.bbox.y2, dpi),
             )
             page.draw_rect(cell_rect, color=(0, 0, 0), width=0.6)
-            if cell.text.strip():
-                align = _ALIGN_MAP.get(cell.align_h, fitz.TEXT_ALIGN_LEFT)
-                kwargs = {"fontsize": 9.0, "align": align, "color": (0, 0, 0)}
-                if body_font:
-                    kwargs["fontfile"] = body_font
-                    kwargs["fontname"] = "F0"
-                else:
-                    kwargs["fontname"] = "helv"
-                inset = cell_rect + (2, 2, -2, -2)
-                page.insert_textbox(inset, cell.text, **kwargs)
+            if not cell.text.strip():
+                continue
+
+            align = _ALIGN_MAP.get(cell.align_h, fitz.TEXT_ALIGN_LEFT)
+            kwargs = {"align": align, "color": (0, 0, 0)}
+            if body_font:
+                kwargs["fontfile"] = body_font
+                kwargs["fontname"] = "F0"
+            else:
+                kwargs["fontname"] = "helv"
+
+            # A fixed 2pt inset alone can consume a short row's entire
+            # height before a font-size retry even gets a chance -- scale
+            # it down instead of using it unconditionally.
+            pad = min(2.0, max(0.0, cell_rect.height * 0.15))
+            inset = cell_rect + (pad, pad, -pad, -pad)
+            if inset.width <= 0 or inset.height <= 0:
+                inset = cell_rect
+
+            fontsize = min(9.0, max(3.0, inset.height * 0.85))
+            remainder = -1.0
+            while remainder < 0 and fontsize > 2.5:
+                kwargs["fontsize"] = fontsize
+                remainder = page.insert_textbox(inset, cell.text, **kwargs)
+                fontsize -= 0.5
+
+            if remainder < 0:
+                # Still doesn't fit even at the smallest legible size --
+                # insert anyway (unpadded, at the floor size) rather than
+                # silently dropping real content; a hairline overflow is a
+                # far smaller defect than losing the data entirely.
+                kwargs["fontsize"] = 2.5
+                page.insert_textbox(cell_rect, cell.text, **kwargs)
 
 
 def _insert_image(doc, page, rect: "fitz.Rect", image_ref: str) -> None:
