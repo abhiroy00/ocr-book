@@ -14,12 +14,16 @@ text-positioned data, just without explicit border geometry.
 """
 from __future__ import annotations
 
+import re
+
 import numpy as np
 
 from app.models.enums import TableDetectionMethod, TextAlign
 from app.schemas.geometry import BBox
 from app.schemas.ocr import OCRWordResult
 from app.tables.models import DetectedCell, DetectedTable
+
+_NUMERIC_TOKEN_RE = re.compile(r"^[+-]?[\d,./%-]*\d[\d,./%-]*$")
 
 
 # A short paragraph (as few as 3 lines, all sharing the same left margin
@@ -65,11 +69,40 @@ def detect_borderless_tables(words: list[OCRWordResult], page_width: int, page_h
 
         if len(run) >= MIN_ROWS:
             bands = _shared_column_bands(run, tolerance)
-            if len(bands) >= MIN_COLS:
+            if len(bands) >= MIN_COLS and _has_numeric_column(run, bands, tolerance):
                 tables.append(_build_table_from_rows(run, bands))
         i = j if j > i + 1 else i + 1
 
     return tables
+
+
+def _has_numeric_column(rows: list[list[OCRWordResult]], bands: list[float], tolerance: float) -> bool:
+    """Real statistical/data tables (the actual target of this fallback --
+    district/crop/rainfall/yield figures) reliably have at least one column
+    of mostly numbers; justified prose essentially never does, even when
+    (rarely) its line starts coincidentally line up into 3+ recurring x-
+    positions the way `_shared_column_bands` requires. This was a real,
+    confirmed false positive: a plain "Explanatory Note" paragraph page
+    got split into several fake tables (row/column checks alone were
+    satisfied) whose "cells" were prose fragments like "in India." and
+    "There is," -- not tabular data. Requiring at least one predominantly-
+    numeric column directly targets that failure mode without tightening
+    the row/column thresholds further (which would risk losing real
+    borderless tables that happen to have fewer rows)."""
+    for band_center in bands:
+        hits = 0
+        numeric = 0
+        for row in rows:
+            band_words = [w for w in row if abs(w.bbox.x1 - band_center) <= tolerance * 2]
+            if not band_words:
+                continue
+            hits += 1
+            cell_text = " ".join(w.text for w in band_words).strip()
+            if _NUMERIC_TOKEN_RE.match(cell_text.replace(" ", "")):
+                numeric += 1
+        if hits >= max(2, int(len(rows) * 0.6)) and numeric >= hits * 0.6:
+            return True
+    return False
 
 
 def _cluster_rows(words: list[OCRWordResult]) -> list[list[OCRWordResult]]:

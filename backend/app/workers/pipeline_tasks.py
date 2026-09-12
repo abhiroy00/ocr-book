@@ -24,7 +24,7 @@ from celery.signals import task_failure
 
 from app.core.celery_app import celery_app
 from app.core.config import get_settings
-from app.core.locks import DOCUMENT_LOCK_PREFIX
+from app.core.locks import DOCUMENT_CANCEL_PREFIX, DOCUMENT_LOCK_PREFIX
 from app.core.logging import get_logger, stage_timer
 from app.db.session import SessionLocal
 from app.layout.detector import LayoutDetector
@@ -41,6 +41,7 @@ from app.services.storage import get_storage
 from app.services.pdf_ingest import iter_render_pages, render_single_page
 from app.tables.engine import detect_tables
 from app.exporters.docx_exporter import render_document_docx
+from app.exporters.excel_exporter import render_document_excel
 from app.vision.preprocessor import PreprocessProfile, preprocess_page
 from app.workers.page_worker_pool import PageWorkerPool, PageWorkResult
 
@@ -92,6 +93,34 @@ def _renew_document_lock(document_id: str, token: str) -> None:
         client.eval(_RENEW_LUA, 1, DOCUMENT_LOCK_PREFIX + document_id, token, str(_DOCUMENT_LOCK_TTL_SECONDS))
     except Exception as exc:  # noqa: BLE001 - a missed renewal just means the lock expires a bit early; not fatal
         logger.warning("document_lock_renew_failed", document_id=document_id, error=str(exc))
+    finally:
+        client.close()
+
+
+def _is_cancel_requested(document_id: str) -> bool:
+    """Checked cooperatively between pages (not a hard kill) so a stop
+    request can never land mid-write and leave a page half-persisted --
+    the current page always finishes normally, and the pipeline simply
+    does not start another one. Cheap enough (one Redis GET) to call once
+    per page without adding meaningful overhead."""
+    settings = get_settings()
+    client = redis.Redis.from_url(settings.redis_url)
+    try:
+        return client.exists(DOCUMENT_CANCEL_PREFIX + document_id) == 1
+    except Exception as exc:  # noqa: BLE001 - a failed check just means "not cancelled"; never abort a job over this
+        logger.warning("cancel_flag_check_failed", document_id=document_id, error=str(exc))
+        return False
+    finally:
+        client.close()
+
+
+def _clear_cancel_flag(document_id: str) -> None:
+    settings = get_settings()
+    client = redis.Redis.from_url(settings.redis_url)
+    try:
+        client.delete(DOCUMENT_CANCEL_PREFIX + document_id)
+    except Exception as exc:  # noqa: BLE001 - best-effort cleanup; a leftover flag just gets ignored (see /cancel endpoint)
+        logger.warning("cancel_flag_clear_failed", document_id=document_id, error=str(exc))
     finally:
         client.close()
 
@@ -151,8 +180,8 @@ def process_document(self, document_id: str, job_id: str) -> str:
         job.celery_task_id = self.request.id
         db.commit()
 
-        _run_pipeline(db, storage, document, job, lock_token)
-        return "completed"
+        cancelled = _run_pipeline(db, storage, document, job, lock_token)
+        return "cancelled" if cancelled else "completed"
     except Exception as exc:  # noqa: BLE001 - top-level guard: never leave a job stuck mid-status
         logger.error("pipeline_failed", document_id=document_id, error=str(exc))
         job = db.get(ProcessingJob, job_id)
@@ -195,7 +224,10 @@ def _on_any_task_failure(sender=None, task_id=None, exception=None, args=None, k
         db.close()
 
 
-def _run_pipeline(db, storage, document: Document, job: ProcessingJob, lock_token: str) -> None:
+def _run_pipeline(db, storage, document: Document, job: ProcessingJob, lock_token: str) -> bool:
+    """Returns True if a `/cancel` request stopped the job partway through
+    (in which case reconstruction/export never runs and the job is left at
+    DocumentStatus.CANCELLED, not FAILED), False if it ran to completion."""
     settings = get_settings()
     # Resolve which provider is actually available (may already fall back
     # e.g. paddleocr -> tesseract here if paddleocr isn't installed at all).
@@ -229,6 +261,7 @@ def _run_pipeline(db, storage, document: Document, job: ProcessingJob, lock_toke
     page_progress_base = 10
     page_progress_span = 55  # 10..65% covers the parallel OCR/layout/table phase across pages
 
+    cancelled = False
     try:
         pool.submit(all_page_numbers)
         for result in pool.results(total_pages):
@@ -253,8 +286,21 @@ def _run_pipeline(db, storage, document: Document, job: ProcessingJob, lock_toke
                 page=result.page_number, message=f"Processed {processed_count}/{total_pages} pages ({pool.alive_count()} workers active)",
             )
             _renew_document_lock(document.id, lock_token)
+
+            if _is_cancel_requested(document.id):
+                logger.info("pipeline_cancel_requested", document_id=document.id, stage="ocr", pages_done=len(received_pages))
+                cancelled = True
+                break
     finally:
         pool.shutdown()
+
+    if cancelled:
+        _clear_cancel_flag(document.id)
+        document_service.update_job_progress(
+            db, job, job.stage, job.progress_percent, DocumentStatus.CANCELLED,
+            message=f"Cancelled by user after {len(received_pages)}/{total_pages} pages",
+        )
+        return True
 
     missing = [n for n in all_page_numbers if n not in received_pages]
     if missing:
@@ -263,10 +309,17 @@ def _run_pipeline(db, storage, document: Document, job: ProcessingJob, lock_toke
             db, job, ProcessingStage.OCR, page_progress_base + page_progress_span, DocumentStatus.OCR_PROCESSING,
             message=f"Retrying {len(missing)} page(s) sequentially",
         )
-        _run_sequential_fallback(
+        fallback_cancelled = _run_sequential_fallback(
             db, storage, document, job, lock_token, original_bytes, is_pdf, job.dpi, profile,
             resolved_provider_name, missing, words_by_page, processed_path_by_page,
         )
+        if fallback_cancelled:
+            _clear_cancel_flag(document.id)
+            document_service.update_job_progress(
+                db, job, job.stage, job.progress_percent, DocumentStatus.CANCELLED,
+                message=f"Cancelled by user after {len(received_pages)}/{total_pages} pages",
+            )
+            return True
 
     document_service.update_job_progress(db, job, ProcessingStage.RECONSTRUCT, 70, DocumentStatus.RECONSTRUCTING, message="Assembling pages in order")
 
@@ -292,22 +345,25 @@ def _run_pipeline(db, storage, document: Document, job: ProcessingJob, lock_toke
     document_service.update_job_progress(db, job, ProcessingStage.RECONSTRUCT, 75, DocumentStatus.RECONSTRUCTING, message="Rendering reconstructed PDF")
     reconstructed_bytes = pdf_renderer.render_document_pdf(all_page_jsons)
 
-    document_service.update_job_progress(db, job, ProcessingStage.EXPORT, 85, DocumentStatus.EXPORTING, message="Exporting PDF/DOCX")
+    document_service.update_job_progress(db, job, ProcessingStage.EXPORT, 85, DocumentStatus.EXPORTING, message="Exporting PDF/DOCX/Excel")
     clean_bytes = clean_doc.tobytes(deflate=True, garbage=4)
     clean_doc.close()
     searchable_bytes = searchable_doc.tobytes(deflate=True, garbage=4)
     searchable_doc.close()
     docx_bytes = render_document_docx(all_page_jsons)
+    excel_bytes = render_document_excel(all_page_jsons, document.original_filename)
 
     _store_export(db, storage, document, ExportType.CLEAN_PDF, f"output/{document.id}/clean.pdf", clean_bytes)
     _store_export(db, storage, document, ExportType.SEARCHABLE_PDF, f"output/{document.id}/searchable.pdf", searchable_bytes)
     _store_export(db, storage, document, ExportType.RECONSTRUCTED_PDF, f"output/{document.id}/reconstructed.pdf", reconstructed_bytes)
     _store_export(db, storage, document, ExportType.DOCX, f"output/{document.id}/document.docx", docx_bytes)
+    _store_export(db, storage, document, ExportType.XLSX, f"output/{document.id}/data.xlsx", excel_bytes)
 
     document_service.update_job_progress(db, job, ProcessingStage.QUALITY, 95, DocumentStatus.EXPORTING, message="Scoring visual similarity")
     _run_quality_pass(db, storage, document, reconstructed_bytes)
 
     document_service.update_job_progress(db, job, ProcessingStage.DONE, 100, DocumentStatus.COMPLETED, message="Done")
+    return False
 
 
 def _persist_page_result(db, document: Document, result: PageWorkResult) -> None:
@@ -330,24 +386,28 @@ def _run_sequential_fallback(
     original_bytes: bytes, is_pdf: bool, dpi: int, profile: PreprocessProfile,
     provider_name: str, missing_pages: list[int],
     words_by_page: dict[int, list], processed_path_by_page: dict[int, str],
-) -> None:
+) -> bool:
     """Last-resort, single-process recovery for any page the parallel pool
     could not deliver a result for (a worker crashed mid-page, or the pool
     ran out of live workers before every page was assigned). This is the
     same one-page-at-a-time path the pipeline used exclusively before
     parallelism was added -- slow, but this only ever runs for the small
     remainder the pool didn't finish, and guarantees no page is silently
-    dropped (spec: never sacrifice correctness/data safety for speed)."""
+    dropped (spec: never sacrifice correctness/data safety for speed).
+
+    Returns True if a `/cancel` request was seen partway through."""
     layout_detector = LayoutDetector()
     ocr_worker = IsolatedOCRWorker(provider_name)
     try:
         for page_number in missing_pages:
+            if _is_cancel_requested(document.id):
+                return True
             try:
                 rendered = render_single_page(original_bytes, is_pdf, page_number, dpi)
                 original_path = f"pages/{document.id}/page_{page_number:04d}_original.png"
                 storage.write(original_path, _encode_png(rendered.image))
 
-                preproc = preprocess_page(rendered.image, profile)
+                preproc = preprocess_page(rendered.image, profile, dpi=rendered.dpi)
                 processed_image = preproc.image
                 processed_path = f"processed/{document.id}/page_{page_number:04d}_processed.png"
                 storage.write(processed_path, _encode_png(processed_image))
@@ -371,6 +431,7 @@ def _run_sequential_fallback(
             _renew_document_lock(document.id, lock_token)
     finally:
         ocr_worker.shutdown()
+    return False
 
 
 def _decode_png(data: bytes):

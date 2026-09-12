@@ -14,6 +14,7 @@ class DocumentStatus(str, enum.Enum):
     EXPORTING = "EXPORTING"
     COMPLETED = "COMPLETED"
     FAILED = "FAILED"
+    CANCELLED = "CANCELLED"
 
 
 class ProcessingStage(str, enum.Enum):
@@ -72,6 +73,7 @@ class ExportType(str, enum.Enum):
     SEARCHABLE_PDF = "searchable_pdf"
     RECONSTRUCTED_PDF = "reconstructed_pdf"
     DOCX = "docx"
+    XLSX = "xlsx"
 
 
 class OCRProviderEnum(str, enum.Enum):

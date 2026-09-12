@@ -10,7 +10,15 @@ from unittest.mock import MagicMock, patch
 from sqlalchemy import update
 
 from app.layout.detector import LayoutBlockResult
-from app.models.enums import DocumentStatus, LayoutBlockType, OCRProviderEnum, PreprocessProfileEnum, TableDetectionMethod, TextAlign
+from app.models.enums import (
+    DocumentStatus,
+    LayoutBlockType,
+    OCRProviderEnum,
+    PreprocessProfileEnum,
+    ProcessingStage,
+    TableDetectionMethod,
+    TextAlign,
+)
 from app.models.processing_job import ProcessingJob
 from app.schemas.geometry import BBox, Polygon
 from app.schemas.ocr import OCRWordResult
@@ -135,6 +143,23 @@ def test_detect_and_fail_stale_job_leaves_recently_updated_job_alone(test_db_ses
     _, job = _make_active_job(test_db_session, tmp_storage, sample_png_bytes)
     result = document_service.detect_and_fail_stale_job(test_db_session, job)
     assert result.status == DocumentStatus.OCR_PROCESSING
+
+
+def test_update_job_progress_cancelled_sets_finished_at_and_propagates_to_document(test_db_session, tmp_storage, sample_png_bytes):
+    """CANCELLED must be treated as a terminal status the same way
+    COMPLETED/FAILED are (finished_at set, document.status mirrored) --
+    otherwise a stopped job looks like it never finished."""
+    document, job = document_service.create_document_from_upload(
+        test_db_session, tmp_storage, "a.png", sample_png_bytes, OCRProviderEnum.PADDLEOCR, 300, PreprocessProfileEnum.BALANCED
+    )
+    document_service.update_job_progress(
+        test_db_session, job, ProcessingStage.OCR, 32, DocumentStatus.CANCELLED, message="Cancelled by user"
+    )
+
+    assert job.status == DocumentStatus.CANCELLED
+    assert job.finished_at is not None
+    test_db_session.refresh(document)
+    assert document.status == DocumentStatus.CANCELLED
 
 
 def test_detect_and_fail_stale_job_leaves_queued_job_alone_even_if_old(test_db_session, tmp_storage, sample_png_bytes):

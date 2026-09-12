@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from typing import Optional
 
+import redis
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile, status
 from fastapi.responses import Response, StreamingResponse
 from sqlalchemy import select
@@ -11,6 +12,7 @@ from sqlalchemy.orm import Session
 from app.api.deps import get_current_user, get_db, get_storage_backend
 from app.core.celery_app import celery_app
 from app.core.config import get_settings
+from app.core.locks import DOCUMENT_CANCEL_PREFIX
 from app.models.document import Document
 from app.models.document_page import DocumentPage
 from app.models.enums import DocumentStatus, ExportType, OCRProviderEnum, PreprocessProfileEnum, TextAlign, VerticalAlign
@@ -72,7 +74,12 @@ async def upload_document(
     except UploadValidationError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
-    celery_app.send_task("pipeline.process_document", args=[document.id, job.id])
+    async_result = celery_app.send_task("pipeline.process_document", args=[document.id, job.id])
+    # Captured here too (not only inside the task itself at `self.request.id`)
+    # so `/cancel` can revoke a job that is still sitting QUEUED and hasn't
+    # started its first page yet, not only one already mid-OCR.
+    job.celery_task_id = async_result.id
+    db.commit()
 
     return DocumentUploadResponse(
         document_id=document.id, job_id=job.id, status=document.status, original_filename=document.original_filename, page_count=document.page_count
@@ -116,7 +123,9 @@ def reprocess_document(document_id: str, body: ProcessRequest, db: Session = Dep
         body.dpi or document.dpi,
         body.preprocess_profile or document.preprocess_profile,
     )
-    celery_app.send_task("pipeline.process_document", args=[document.id, job.id])
+    async_result = celery_app.send_task("pipeline.process_document", args=[document.id, job.id])
+    job.celery_task_id = async_result.id
+    db.commit()
     return ProcessingJobRead.model_validate(job)
 
 
@@ -130,6 +139,58 @@ def get_progress(document_id: str, db: Session = Depends(get_db)):
         raise HTTPException(status_code=404, detail="No processing job found for this document")
     job = document_service.detect_and_fail_stale_job(db, job)
     return ProcessingJobRead.model_validate(job)
+
+
+_CANCELLABLE_STATUSES = {
+    DocumentStatus.QUEUED,
+    DocumentStatus.PROCESSING,
+    DocumentStatus.OCR_PROCESSING,
+    DocumentStatus.LAYOUT_PROCESSING,
+    DocumentStatus.TABLE_PROCESSING,
+    DocumentStatus.RECONSTRUCTING,
+    DocumentStatus.EXPORTING,
+}
+
+
+@router.post("/{document_id}/cancel")
+def cancel_processing(document_id: str, db: Session = Depends(get_db)):
+    """Stops an in-flight pipeline run. Cooperative, not a hard kill: sets
+    a Redis flag the running task checks between pages (see
+    `app.workers.pipeline_tasks._is_cancel_requested`), so the page
+    currently being processed always finishes cleanly and the document is
+    left with whatever pages already completed rather than a half-written
+    one. Also revokes the Celery task outright, which matters if it is
+    still queued and hasn't started page 1 yet (the cooperative flag alone
+    would never get checked in that case)."""
+    _get_document_or_404(db, document_id)
+    job = db.scalar(
+        select(ProcessingJob).where(ProcessingJob.document_id == document_id).order_by(ProcessingJob.created_at.desc())
+    )
+    if job is None or job.status not in _CANCELLABLE_STATUSES:
+        raise HTTPException(status_code=400, detail="Document is not currently processing")
+
+    settings = get_settings()
+    client = redis.Redis.from_url(settings.redis_url)
+    try:
+        client.set(DOCUMENT_CANCEL_PREFIX + document_id, "1", ex=3600)
+    finally:
+        client.close()
+
+    if job.celery_task_id:
+        celery_app.control.revoke(job.celery_task_id)
+
+    # Covers the case where the task hasn't started yet (still QUEUED) and
+    # so will never reach the cooperative flag check at all now that it's
+    # revoked -- without this the job would sit at QUEUED forever. If the
+    # task IS already mid-page, its own next per-page progress update can
+    # briefly overwrite this back to an active status before the flag
+    # check catches up on the following page; that self-corrects within
+    # one page's processing time and is not worth adding coordination for.
+    document_service.update_job_progress(
+        db, job, job.stage, job.progress_percent, DocumentStatus.CANCELLED, message="Cancelled by user"
+    )
+
+    return {"status": "cancel_requested"}
 
 
 @router.get("/{document_id}/pages", response_model=list[PageRead])
@@ -232,60 +293,123 @@ def update_cell(document_id: str, cell_id: str, body: TableCellUpdate, db: Sessi
     return TableCellRead.model_validate(cell)
 
 
+def _dispatch_export(document_id: str, db: Session, target: str) -> dict:
+    """Queues a regenerate task and returns immediately -- never blocks
+    the HTTP request on the actual PDF/DOCX/Excel work. This replaced a
+    synchronous implementation after a confirmed real problem: a 145-page
+    document's regenerate request outlived a 300s client timeout while
+    still completing correctly server-side, which for a large document
+    library (any single document over roughly 100-150 pages on a
+    resource-constrained host) makes every regenerate action from the UI
+    look broken even though nothing actually failed."""
+    from app.workers.export_tasks import regenerate_document_export
+
+    _get_document_or_404(db, document_id)  # 404 before queuing a task for nothing
+    async_result = regenerate_document_export.delay(document_id, target)
+    return {"status": "queued", "task_id": async_result.id, "target": target}
+
+
 @router.post("/{document_id}/reconstruct")
-def reconstruct(document_id: str, db: Session = Depends(get_db), storage: StorageBackend = Depends(get_storage_backend)):
-    """Re-renders the reconstructed PDF from the current (possibly
-    user-edited) Document JSON, without re-running OCR/layout/table
-    detection."""
-    from app.reconstruction.pdf_renderer import render_document_pdf
-
-    document = _get_document_or_404(db, document_id)
-    doc_json = document_service.get_document_json(db, document)
-    if not doc_json.pages:
-        raise HTTPException(status_code=409, detail="Document has not been processed yet")
-
-    pdf_bytes = render_document_pdf(doc_json.pages)
-    relative_path = f"output/{document.id}/reconstructed.pdf"
-    storage.write(relative_path, pdf_bytes)
-    document_service.record_export_file(db, document, ExportType.RECONSTRUCTED_PDF, relative_path, len(pdf_bytes))
-    return {"status": "ok", "size_bytes": len(pdf_bytes)}
+def reconstruct(document_id: str, db: Session = Depends(get_db)):
+    """Queues a re-render of the reconstructed PDF from the current
+    (possibly user-edited) Document JSON, without re-running OCR/layout/
+    table detection. Poll `GET .../export/status/{task_id}` for
+    completion."""
+    return _dispatch_export(document_id, db, "reconstructed_pdf")
 
 
 @router.post("/{document_id}/export/pdf")
-def export_pdf(document_id: str, db: Session = Depends(get_db), storage: StorageBackend = Depends(get_storage_backend)):
-    return reconstruct(document_id, db, storage)
+def export_pdf(document_id: str, db: Session = Depends(get_db)):
+    return reconstruct(document_id, db)
 
 
 @router.post("/{document_id}/export/docx")
-def export_docx(document_id: str, db: Session = Depends(get_db), storage: StorageBackend = Depends(get_storage_backend)):
-    from app.exporters.docx_exporter import render_document_docx
+def export_docx(document_id: str, db: Session = Depends(get_db)):
+    return _dispatch_export(document_id, db, "docx")
 
-    document = _get_document_or_404(db, document_id)
-    doc_json = document_service.get_document_json(db, document)
-    if not doc_json.pages:
-        raise HTTPException(status_code=409, detail="Document has not been processed yet")
 
-    docx_bytes = render_document_docx(doc_json.pages)
-    relative_path = f"output/{document.id}/document.docx"
-    storage.write(relative_path, docx_bytes)
-    document_service.record_export_file(db, document, ExportType.DOCX, relative_path, len(docx_bytes))
-    return {"status": "ok", "size_bytes": len(docx_bytes)}
+@router.post("/{document_id}/export/pdf/searchable")
+def export_searchable_pdf(document_id: str, db: Session = Depends(get_db)):
+    """Queues a regeneration of clean.pdf + searchable.pdf (the image-based
+    exports, including the primary "cleaned searchable PDF" download) from
+    the currently-stored processed page images + OCR words, without a full
+    reprocess -- see `app.workers.export_tasks.regenerate_document_export`
+    and `document_service.rebuild_image_based_exports`. Poll
+    `GET .../export/status/{task_id}` for completion."""
+    return _dispatch_export(document_id, db, "searchable_pdf")
+
+
+@router.post("/{document_id}/export/excel")
+def export_excel(document_id: str, db: Session = Depends(get_db)):
+    """Structured-data export (Pipeline B) -- one sheet per detected table,
+    read from the same Document JSON PDF/DOCX read, never re-derived from
+    either of them (spec section 52: Document JSON is the one source of
+    truth all three exports branch from). Poll
+    `GET .../export/status/{task_id}` for completion."""
+    return _dispatch_export(document_id, db, "excel")
+
+
+@router.get("/{document_id}/export/status/{task_id}")
+def export_status(document_id: str, task_id: str, db: Session = Depends(get_db)):
+    """Polls an async regenerate task started by one of the export/
+    reconstruct endpoints above. `state` is one of Celery's own task
+    states (PENDING while queued or running -- Celery does not distinguish
+    the two without extra instrumentation this lightweight task doesn't
+    need -- SUCCESS, or FAILURE); `result` carries the target's output
+    dict (e.g. `size_bytes`) once state is SUCCESS."""
+    _get_document_or_404(db, document_id)
+    async_result = celery_app.AsyncResult(task_id)
+    payload = {"task_id": task_id, "state": async_result.state}
+    if async_result.state == "SUCCESS":
+        payload["result"] = async_result.result
+    elif async_result.state == "FAILURE":
+        payload["error"] = str(async_result.result)
+    return payload
 
 
 @router.get("/{document_id}/download/pdf")
 def download_pdf(document_id: str, db: Session = Depends(get_db), storage: StorageBackend = Depends(get_storage_backend)):
-    return _download_export(db, storage, document_id, ExportType.RECONSTRUCTED_PDF, "application/pdf", "reconstructed.pdf")
+    """The primary "cleaned searchable PDF" download (spec sections 1/14/
+    16/29/38): the cleaned page image with an invisible OCR text layer,
+    NOT the from-scratch font/textbox reconstruction -- visual fidelity to
+    the original scanned book is the explicit priority for this download,
+    with search/copy support layered invisibly on top rather than
+    replacing the page's appearance. The fully reconstructed, editable
+    (real vector text/tables) PDF is still generated every run and stays
+    available at /download/pdf/reconstructed for the editing workflow."""
+    document = _get_document_or_404(db, document_id)
+    filename = f"{_export_basename(document.original_filename)}_cleaned_searchable.pdf"
+    return _download_export(db, storage, document_id, ExportType.SEARCHABLE_PDF, "application/pdf", filename)
+
+
+@router.get("/{document_id}/download/pdf/reconstructed")
+def download_reconstructed_pdf(document_id: str, db: Session = Depends(get_db), storage: StorageBackend = Depends(get_storage_backend)):
+    document = _get_document_or_404(db, document_id)
+    filename = f"{_export_basename(document.original_filename)}_reconstructed.pdf"
+    return _download_export(db, storage, document_id, ExportType.RECONSTRUCTED_PDF, "application/pdf", filename)
 
 
 @router.get("/{document_id}/download/docx")
 def download_docx(document_id: str, db: Session = Depends(get_db), storage: StorageBackend = Depends(get_storage_backend)):
+    document = _get_document_or_404(db, document_id)
+    filename = f"{_export_basename(document.original_filename)}.docx"
     return _download_export(
         db,
         storage,
         document_id,
         ExportType.DOCX,
         "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-        "document.docx",
+        filename,
+    )
+
+
+@router.get("/{document_id}/download/excel")
+def download_excel(document_id: str, db: Session = Depends(get_db), storage: StorageBackend = Depends(get_storage_backend)):
+    document = _get_document_or_404(db, document_id)
+    filename = f"{_export_basename(document.original_filename)}_extracted_data.xlsx"
+    return _download_export(
+        db, storage, document_id, ExportType.XLSX,
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", filename,
     )
 
 
@@ -348,6 +472,17 @@ def _page_to_read(page: DocumentPage, storage: StorageBackend) -> PageRead:
         table_confidence_avg=page.table_confidence_avg,
         visual_similarity_score=page.visual_similarity_score,
     )
+
+
+def _export_basename(original_filename: str) -> str:
+    """`book.pdf` -> `book` (spec section 30: exports are named
+    `{original}_cleaned_searchable.pdf` / `{original}_extracted_data.xlsx`,
+    never the generic `reconstructed.pdf`/`document.docx` internal storage
+    names, which stay as-is since they're never user-facing)."""
+    from pathlib import Path
+
+    stem = Path(original_filename or "document").stem
+    return stem or "document"
 
 
 def _download_export(db: Session, storage: StorageBackend, document_id: str, export_type: ExportType, media_type: str, filename: str):

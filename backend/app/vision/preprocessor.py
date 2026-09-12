@@ -190,6 +190,104 @@ def adaptive_threshold(image: np.ndarray, block_size: int = 35, c: int = 15) -> 
     )
 
 
+def remove_isolated_speckles(image: np.ndarray, dpi: int) -> np.ndarray:
+    """Removes small, isolated ink specks (scan dust/dirt/scratches) while
+    preserving real content -- including marks that are small themselves,
+    like decimal points, punctuation, and the dot-leader lines common in
+    old typewritten statistical tables ("District  . . . . . . .  30").
+
+    The safety mechanism is proximity, not just size: a candidate speck is
+    only removed if NOTHING else -- no other speck, no character stroke,
+    nothing -- exists within a small bridging radius around it. A decimal
+    point always sits immediately against its digits; a dot-leader's dots
+    always sit immediately against their neighboring dots in the same
+    line. Genuine dust in a blank margin has nothing near it. This was a
+    real, confirmed user complaint: visible black flecks in blank areas of
+    a scanned page survived every existing preprocessing profile (FAST
+    does no artifact removal at all; BALANCED/HIGH_QUALITY normalize
+    background/contrast but never touch isolated ink specks either).
+    """
+    gray = _to_gray(image)
+    _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(binary, connectivity=8)
+    if num_labels <= 1:
+        return image.copy()
+
+    # Candidate specks: up to ~0.9mm across at real-world scan resolution
+    # (a generous upper bound -- this is only a candidate *filter*, not the
+    # actual safety check, so it's fine for it to also catch dot-leader
+    # dots and small punctuation; the proximity check below is what
+    # decides what actually gets removed). Scaled to the actual render DPI
+    # so this behaves consistently across DPI settings.
+    max_dot_diameter_px = max(3, int(0.9 / 25.4 * dpi))
+    max_dot_area = max(6, int(np.pi * (max_dot_diameter_px / 2) ** 2 * 2))
+    # The bridging radius has to comfortably span real dash/dot-leader
+    # spacing -- measured directly against a real scanned statistical
+    # table (not assumed): consecutive dash marks in an actual "District
+    # . . . . 30"-style leader row sat ~3.4mm apart center-to-center, well
+    # past an initial, too-tight 2.2mm guess that caused most of a real
+    # leader row to be wrongly erased during testing. 5mm gives real
+    # margin above that measurement. Genuinely isolated dust in a blank
+    # page margin sits far, far beyond this (confirmed: 100+ px away in
+    # every real case checked), so this still cleanly distinguishes the
+    # two.
+    bridge_radius = max(4, int(5.0 / 25.4 * dpi))
+
+    areas = stats[:, cv2.CC_STAT_AREA]
+    # Dust/dirt specks are round-ish; a hyphen, dash, or underline segment
+    # is short but *wide* -- excluding elongated shapes from candidacy at
+    # all (not just relying on the proximity check) protects dash-leader
+    # table rules ("AIZAWL  - - - - - 30") directly, since those dashes
+    # are exactly small-area-but-elongated, the one shape real content
+    # shares with genuine specks by area alone.
+    max_aspect_ratio = 2.2
+    small_label_ids = []
+    for lbl in range(1, num_labels):
+        if areas[lbl] > max_dot_area:
+            continue
+        w, h = stats[lbl, cv2.CC_STAT_WIDTH], stats[lbl, cv2.CC_STAT_HEIGHT]
+        if max(w, h) / max(1, min(w, h)) > max_aspect_ratio:
+            continue
+        small_label_ids.append(lbl)
+    if not small_label_ids:
+        return image.copy()
+
+    all_ink_mask = binary
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (bridge_radius * 2 + 1, bridge_radius * 2 + 1))
+    # A small dilation (not just the razor-exact OTSU-labeled pixels) so a
+    # removed speck's own faint anti-aliased fuzz doesn't survive as a
+    # visible pale "halo"/ring around a now-empty center -- confirmed as a
+    # real artifact against an actual scanned page during testing.
+    erase_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+    remove_mask = np.zeros_like(binary)
+    h_img, w_img = binary.shape[:2]
+
+    for label in small_label_ids:
+        x, y, w, h, _area = stats[label]
+        pad = bridge_radius + 2
+        y0, y1 = max(0, y - pad), min(h_img, y + h + pad)
+        x0, x1 = max(0, x - pad), min(w_img, x + w + pad)
+
+        component_local = (labels[y0:y1, x0:x1] == label)
+        other_ink_local = all_ink_mask[y0:y1, x0:x1].copy()
+        other_ink_local[component_local] = 0
+
+        dilated_local = cv2.dilate(component_local.astype(np.uint8) * 255, kernel)
+        if np.any((dilated_local > 0) & (other_ink_local > 0)):
+            continue  # something else nearby (punctuation context, dot-leader, real content) -- keep
+        erased = cv2.dilate(component_local.astype(np.uint8) * 255, erase_kernel)
+        remove_mask[y0:y1, x0:x1][erased > 0] = 255
+
+    if not remove_mask.any():
+        return image.copy()
+
+    result = image.copy()
+    fill = (255, 255, 255) if len(image.shape) == 3 else 255
+    result[remove_mask > 0] = fill
+    return result
+
+
 # ----------------------------------------------------------------------------
 # Page boundary / perspective / borders / dewarp
 # ----------------------------------------------------------------------------
@@ -283,7 +381,12 @@ def dewarp_page(image: np.ndarray) -> np.ndarray:
 # Profile pipeline
 # ----------------------------------------------------------------------------
 
-def preprocess_page(image: np.ndarray, profile: PreprocessProfile) -> PreprocessResult:
+def preprocess_page(image: np.ndarray, profile: PreprocessProfile, dpi: int = 300) -> PreprocessResult:
+    """`dpi` (default 300, matching this module's pre-existing default
+    render DPI) scales the isolated-speckle-removal size threshold so it
+    behaves consistently regardless of what DPI a page was actually
+    rendered at -- a dust fleck is a physical size on the original paper,
+    not a fixed pixel count."""
     steps: list[str] = []
     working = image.copy()
 
@@ -301,6 +404,8 @@ def preprocess_page(image: np.ndarray, profile: PreprocessProfile) -> Preprocess
         steps.append("grayscale")
         working = cv2.fastNlMeansDenoising(working, h=5, templateWindowSize=7, searchWindowSize=21)
         steps.append("mild_denoise")
+        working = remove_isolated_speckles(working, dpi)
+        steps.append("speckle_removal")
         return PreprocessResult(working, coarse_angle, skew_angle, False, steps)
 
     boundary_found = False
@@ -321,6 +426,9 @@ def preprocess_page(image: np.ndarray, profile: PreprocessProfile) -> Preprocess
 
     working = enhance_contrast(working)
     steps.append("contrast_enhance")
+
+    working = remove_isolated_speckles(working, dpi)
+    steps.append("speckle_removal")
 
     if profile == PreprocessProfile.BALANCED:
         working = _to_gray(working)

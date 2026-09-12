@@ -153,7 +153,7 @@ def _child_main(
             original_path = f"pages/{document_id}/page_{page_number:04d}_original.png"
             storage.write(original_path, _encode_png(rendered.image))
 
-            preproc = preprocess_page(rendered.image, profile)
+            preproc = preprocess_page(rendered.image, profile, dpi=rendered.dpi)
             processed_image = preproc.image
             processed_path = f"processed/{document_id}/page_{page_number:04d}_processed.png"
             storage.write(processed_path, _encode_png(processed_image))

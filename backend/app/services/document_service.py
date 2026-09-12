@@ -182,7 +182,7 @@ def update_job_progress(
         job.error_message = error
     if status == DocumentStatus.PROCESSING and job.started_at is None:
         job.started_at = datetime.now(timezone.utc)
-    if status in (DocumentStatus.COMPLETED, DocumentStatus.FAILED):
+    if status in (DocumentStatus.COMPLETED, DocumentStatus.FAILED, DocumentStatus.CANCELLED):
         job.finished_at = datetime.now(timezone.utc)
 
     document = db.get(Document, job.document_id)
@@ -676,6 +676,111 @@ def _touch_page_json_table_cell(db: Session, cell: TableCell) -> None:
     page.document_json = data
     flag_modified(page, "document_json")  # in-place dict mutation needs an explicit flag (plain JSON column)
     db.commit()
+
+
+def _ocr_block_to_word(b: OCRBlock) -> OCRWordResult:
+    from app.schemas.geometry import BBox, Polygon
+
+    bbox = b.bbox or {}
+    polygon_pts = b.polygon or [[bbox.get("x1", 0), bbox.get("y1", 0)], [bbox.get("x2", 0), bbox.get("y1", 0)],
+                                 [bbox.get("x2", 0), bbox.get("y2", 0)], [bbox.get("x1", 0), bbox.get("y2", 0)]]
+    return OCRWordResult(
+        text=b.corrected_text or b.text,
+        confidence=b.confidence,
+        bbox=BBox(**bbox),
+        polygon=Polygon.from_xy_list(polygon_pts),
+        page_number=0,  # not needed by callers here; per-page context is already known
+        block_id=b.block_id,
+        line_id=b.line_id,
+        language=b.language or "und",
+    )
+
+
+def get_page_ocr_words(db: Session, page_id: str) -> list[OCRWordResult]:
+    """Word-level OCR results for one page, read back from `OCRBlock` rows.
+    Used to rebuild image-based exports (clean/searchable PDF) on demand --
+    those need per-word boxes, unlike the Document JSON's `PageJSON.blocks`
+    content, which is already grouped into layout-block-level text runs.
+
+    For a whole document (many pages), prefer
+    `get_ocr_words_by_page_for_document` -- one query for every page
+    instead of one query per page."""
+    blocks = db.scalars(
+        select(OCRBlock).where(OCRBlock.page_id == page_id).order_by(OCRBlock.reading_order_index)
+    ).all()
+    return [_ocr_block_to_word(b) for b in blocks]
+
+
+def get_ocr_words_by_page_for_document(db: Session, document_id: str) -> dict[str, list[OCRWordResult]]:
+    """Same word-level data as `get_page_ocr_words`, but for every page of
+    a document in a single query -- avoids N round-trips (one per page)
+    when rebuilding a whole document's image-based exports, which for a
+    100+ page document is otherwise a real, measurable contributor to how
+    long a "regenerate" request takes."""
+    rows = db.scalars(
+        select(OCRBlock)
+        .where(OCRBlock.document_id == document_id)
+        .order_by(OCRBlock.page_id, OCRBlock.reading_order_index)
+    ).all()
+    by_page: dict[str, list[OCRWordResult]] = {}
+    for b in rows:
+        by_page.setdefault(b.page_id, []).append(_ocr_block_to_word(b))
+    return by_page
+
+
+def rebuild_image_based_exports(db: Session, storage, document: Document) -> dict:
+    """Regenerates `clean.pdf` and `searchable.pdf` from the currently-
+    stored processed page images + OCR words, without re-running OCR/
+    layout/table detection. This is the on-demand equivalent of what the
+    full pipeline does incrementally per page -- needed because those two
+    exports (unlike reconstructed.pdf/docx/xlsx, which all rebuild from the
+    lightweight Document JSON) depend on the actual page raster images, so
+    there was previously no way to regenerate them short of a full
+    reprocess -- meaning a bug fix or a corrected/re-OCR'd page had no way
+    to reach an already-completed document's searchable PDF at all."""
+    import fitz
+
+    from app.reconstruction import clean_pdf, searchable_pdf
+    from app.reconstruction.fonts import resolve_body_font_path
+
+    pages = db.scalars(
+        select(DocumentPage).where(DocumentPage.document_id == document.id).order_by(DocumentPage.page_number)
+    ).all()
+    if not pages:
+        return {"clean_pdf_bytes": 0, "searchable_pdf_bytes": 0, "pages": 0}
+
+    font_path = resolve_body_font_path()
+    clean_doc = fitz.open()
+    searchable_doc = fitz.open()
+    import cv2
+    import numpy as np
+
+    # One query for every page's OCR words instead of one query per page --
+    # a real, measurable difference for 100+ page documents.
+    words_by_page = get_ocr_words_by_page_for_document(db, document.id)
+
+    for page in pages:
+        if not page.processed_image_path or not storage.exists(page.processed_image_path):
+            continue
+        image_bytes = storage.read(page.processed_image_path)
+        image = cv2.imdecode(np.frombuffer(image_bytes, dtype=np.uint8), cv2.IMREAD_COLOR)
+        if image is None:
+            continue
+        words = words_by_page.get(page.id, [])
+        clean_pdf.add_clean_page(clean_doc, image, page.dpi)
+        searchable_pdf.add_searchable_page(searchable_doc, image, page.dpi, words, font_path)
+
+    clean_bytes = clean_doc.tobytes(deflate=True, garbage=4)
+    clean_doc.close()
+    searchable_bytes = searchable_doc.tobytes(deflate=True, garbage=4)
+    searchable_doc.close()
+
+    storage.write(f"output/{document.id}/clean.pdf", clean_bytes)
+    storage.write(f"output/{document.id}/searchable.pdf", searchable_bytes)
+    record_export_file(db, document, ExportType.CLEAN_PDF, f"output/{document.id}/clean.pdf", len(clean_bytes))
+    record_export_file(db, document, ExportType.SEARCHABLE_PDF, f"output/{document.id}/searchable.pdf", len(searchable_bytes))
+
+    return {"clean_pdf_bytes": len(clean_bytes), "searchable_pdf_bytes": len(searchable_bytes), "pages": len(pages)}
 
 
 def record_export_file(db: Session, document: Document, export_type: ExportType, storage_path: str, size_bytes: int) -> ExportFile:

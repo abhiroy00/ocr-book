@@ -87,6 +87,11 @@ export const documentsApi = {
     return data;
   },
 
+  cancel: async (documentId: string) => {
+    const { data } = await api.post(`/documents/${documentId}/cancel`);
+    return data as { status: string };
+  },
+
   pages: async (documentId: string) => {
     const { data } = await api.get<PageRecord[]>(`/documents/${documentId}/pages`);
     return data;
@@ -140,23 +145,56 @@ export const documentsApi = {
     return data;
   },
 
+  // Every regenerate/export action below is queued as an async Celery
+  // task server-side (see backend `_dispatch_export`) rather than run
+  // inline in the HTTP request -- a large (100+ page) document's
+  // regenerate could otherwise take longer than any reasonable client
+  // timeout while still completing correctly server-side, making the
+  // action look broken even though nothing failed. `pollExportStatus`
+  // dispatches, then polls status until the task finishes, so from a
+  // caller's point of view (e.g. a `useMutation`) the returned promise
+  // still only resolves once the file is actually ready -- no other
+  // UI code needs to change to get the non-blocking behavior.
+  pollExportStatus: async (documentId: string, taskId: string, { intervalMs = 2000, timeoutMs = 30 * 60 * 1000 } = {}) => {
+    const startedAt = Date.now();
+    while (Date.now() - startedAt < timeoutMs) {
+      const { data } = await api.get(`/documents/${documentId}/export/status/${taskId}`);
+      if (data.state === "SUCCESS") return data.result;
+      if (data.state === "FAILURE") throw new Error(data.error || "Export failed");
+      await new Promise((resolve) => setTimeout(resolve, intervalMs));
+    }
+    throw new Error("Export timed out waiting for the background task to finish");
+  },
+
   reconstruct: async (documentId: string) => {
     const { data } = await api.post(`/documents/${documentId}/reconstruct`);
-    return data;
+    return documentsApi.pollExportStatus(documentId, data.task_id);
+  },
+
+  exportSearchablePdf: async (documentId: string) => {
+    const { data } = await api.post(`/documents/${documentId}/export/pdf/searchable`);
+    return documentsApi.pollExportStatus(documentId, data.task_id);
   },
 
   exportPdf: async (documentId: string) => {
     const { data } = await api.post(`/documents/${documentId}/export/pdf`);
-    return data;
+    return documentsApi.pollExportStatus(documentId, data.task_id);
   },
 
   exportDocx: async (documentId: string) => {
     const { data } = await api.post(`/documents/${documentId}/export/docx`);
-    return data;
+    return documentsApi.pollExportStatus(documentId, data.task_id);
+  },
+
+  exportExcel: async (documentId: string) => {
+    const { data } = await api.post(`/documents/${documentId}/export/excel`);
+    return documentsApi.pollExportStatus(documentId, data.task_id);
   },
 
   downloadPdfUrl: (documentId: string) => `${API_BASE_URL}/documents/${documentId}/download/pdf`,
+  downloadReconstructedPdfUrl: (documentId: string) => `${API_BASE_URL}/documents/${documentId}/download/pdf/reconstructed`,
   downloadDocxUrl: (documentId: string) => `${API_BASE_URL}/documents/${documentId}/download/docx`,
+  downloadExcelUrl: (documentId: string) => `${API_BASE_URL}/documents/${documentId}/download/excel`,
 
   quality: async (documentId: string) => {
     const { data } = await api.get<QualityReport>(`/documents/${documentId}/quality`);

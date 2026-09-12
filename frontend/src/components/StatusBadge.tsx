@@ -12,6 +12,7 @@ const STYLES: Record<DocumentStatus, string> = {
   EXPORTING: "bg-amber-100 text-amber-800",
   COMPLETED: "bg-emerald-100 text-emerald-800",
   FAILED: "bg-red-100 text-red-800",
+  CANCELLED: "bg-slate-200 text-slate-600",
 };
 
 export default function StatusBadge({ status }: { status: DocumentStatus }) {

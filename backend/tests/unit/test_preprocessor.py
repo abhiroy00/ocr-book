@@ -8,6 +8,7 @@ from app.vision.preprocessor import (
     deskew_image,
     detect_and_remove_black_borders,
     detect_rotation,
+    remove_isolated_speckles,
     preprocess_page,
 )
 
@@ -153,3 +154,127 @@ def test_preprocess_never_mutates_input():
     original_copy = img.copy()
     preprocess_page(img, PreprocessProfile.BALANCED)
     assert np.array_equal(img, original_copy)
+
+
+# ----------------------------------------------------------------------------
+# remove_isolated_speckles -- real user-reported bug: black dust flecks in
+# blank page areas survived every preprocessing profile (FAST does no
+# artifact removal at all; BALANCED/HIGH_QUALITY normalize background/
+# contrast but never touched isolated ink specks either).
+# ----------------------------------------------------------------------------
+
+_DPI = 150
+
+
+def _blank_page(width=900, height=1200):
+    return np.full((height, width), 255, dtype=np.uint8)
+
+
+def _dot(img, cx, cy, radius_px=2):
+    cv2.circle(img, (cx, cy), radius_px, 0, -1)
+
+
+def test_remove_isolated_speckles_removes_dust_in_blank_margin():
+    img = _blank_page()
+    # A block of real text elsewhere on the page...
+    cv2.putText(img, "REAL TEXT", (100, 100), cv2.FONT_HERSHEY_SIMPLEX, 1.0, 0, 2)
+    # ...and a handful of small isolated dots far away in blank space (and
+    # far apart from *each other* too -- unlike a dot-leader's evenly,
+    # tightly spaced dots), matching the real user-reported screenshot
+    # (dust flecks scattered in an otherwise-empty lower page area).
+    dot_positions = [(400, 700), (600, 750), (900 - 200, 1200 - 300)]
+    for cx, cy in dot_positions:
+        _dot(img, cx, cy, radius_px=2)
+
+    cleaned = remove_isolated_speckles(img, _DPI)
+
+    # The dots are gone (region around them is now pure white)...
+    for cx, cy in dot_positions:
+        region = cleaned[cy - 5 : cy + 5, cx - 5 : cx + 5]
+        assert region.min() == 255, f"speck at ({cx},{cy}) was not removed"
+    # ...but the real text survived.
+    assert cleaned[90:110, 95:250].min() < 255
+
+
+def test_remove_isolated_speckles_preserves_decimal_points():
+    """A decimal point sits immediately against its digits -- it must
+    never be treated as an isolated speck, even though it's just as small
+    as one."""
+    img = _blank_page()
+    cv2.putText(img, "12.50", (100, 100), cv2.FONT_HERSHEY_SIMPLEX, 1.2, 0, 2)
+    before_ink = int((img < 200).sum())
+
+    cleaned = remove_isolated_speckles(img, _DPI)
+    after_ink = int((cleaned < 200).sum())
+
+    # Real, connected text should be essentially untouched (isolation
+    # check keeps every glyph, since each sits directly against its
+    # neighbors).
+    assert after_ink >= before_ink * 0.95
+
+
+def test_remove_isolated_speckles_preserves_dot_leader_table_lines():
+    """Old typewritten statistical tables commonly use dot-leader rules
+    ("District . . . . . . . 30") between a label and its value -- a
+    legitimate typographic convention, not a scan artifact. Each dot sits
+    close to its neighboring dots in the same leader, so the proximity
+    check must keep the whole line."""
+    img = _blank_page()
+    y = 300
+    for x in range(100, 500, 12):
+        _dot(img, x, y, radius_px=2)
+
+    cleaned = remove_isolated_speckles(img, _DPI)
+
+    dots_remaining = sum(1 for x in range(100, 500, 12) if cleaned[y, x] < 200)
+    assert dots_remaining >= 30  # all (or essentially all) of the ~33 dots survived
+
+
+def test_remove_isolated_speckles_noop_on_blank_page():
+    img = _blank_page()
+    cleaned = remove_isolated_speckles(img, _DPI)
+    assert np.array_equal(img, cleaned)
+
+
+def test_remove_isolated_speckles_preserves_isolated_dash_leader_marks():
+    """Regression test for a real, confirmed artifact: old typewritten
+    tables often use short dashes ("-") rather than dots as leader/filler
+    marks ("AIZAWL  - - - - - -  30"), each one small and, at the ends of
+    a sparse row, potentially far from its neighbors. A dash is short but
+    *wide* (elongated), unlike round dust -- shape alone (not just
+    proximity) must protect it, and the removal must never leave a pale
+    "halo" ring where a dash's own anti-aliased edge survives after its
+    center is erased."""
+    img = _blank_page()
+    # A single, deliberately isolated dash far from anything else --
+    # worst case for the proximity check alone.
+    cv2.rectangle(img, (400, 400), (412, 404), 0, -1)  # ~12x4px, aspect ratio 3:1
+
+    cleaned = remove_isolated_speckles(img, _DPI)
+
+    assert cleaned[402, 406] < 200, "an isolated dash mark was wrongly removed"
+    # No partial "halo" erosion: the dash should be exactly as solid as before.
+    assert int((cleaned[398:406, 398:414] < 200).sum()) == int((img[398:406, 398:414] < 200).sum())
+
+
+def test_remove_isolated_speckles_removes_a_round_isolated_dot_even_far_from_everything():
+    img = _blank_page()
+    _dot(img, 400, 400, radius_px=2)
+    cleaned = remove_isolated_speckles(img, _DPI)
+    assert cleaned[398:404, 398:404].min() == 255
+
+
+def test_remove_isolated_speckles_does_not_wipe_a_sparse_dotted_page():
+    """A page that is ENTIRELY dot-leaders and small marks (no single
+    "large" component anywhere) must not be wiped out -- the isolation
+    check (proximity to *any* other ink, not just to "large" content) is
+    what protects this, not a large-component anchor requirement."""
+    img = _blank_page()
+    for y in range(200, 1000, 40):
+        for x in range(100, 700, 12):
+            _dot(img, x, y, radius_px=2)
+
+    cleaned = remove_isolated_speckles(img, _DPI)
+    remaining_ink = int((cleaned < 200).sum())
+    original_ink = int((img < 200).sum())
+    assert remaining_ink >= original_ink * 0.8

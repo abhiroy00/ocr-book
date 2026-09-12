@@ -8,7 +8,8 @@ export type DocumentStatus =
   | "RECONSTRUCTING"
   | "EXPORTING"
   | "COMPLETED"
-  | "FAILED";
+  | "FAILED"
+  | "CANCELLED";
 
 export type ProcessingStage =
   | "upload"

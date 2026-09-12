@@ -1,4 +1,5 @@
-import { useQuery } from "@tanstack/react-query";
+import { useState } from "react";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Link, useParams } from "react-router-dom";
 import { documentsApi, fileUrl } from "@/services/api";
 import { useDocumentProgress } from "@/hooks/useDocumentProgress";
@@ -31,6 +32,8 @@ const ACTIVE_STATUSES = new Set([
 
 export default function DocumentDetailPage() {
   const { id } = useParams<{ id: string }>();
+  const queryClient = useQueryClient();
+  const [cancelRequested, setCancelRequested] = useState(false);
   const { data: document, refetch } = useQuery({
     queryKey: ["document", id],
     queryFn: () => documentsApi.get(id!),
@@ -40,6 +43,23 @@ export default function DocumentDetailPage() {
 
   const isActive = !!document && ACTIVE_STATUSES.has(document.status);
   const progressEvent = useDocumentProgress(id, isActive);
+
+  // Reset the button's own "Stopping…" flag once the document actually
+  // leaves an active status, rather than a fixed timeout -- cancellation
+  // is cooperative (the current page finishes first, see
+  // `pipeline_tasks._is_cancel_requested`), so how long it takes to land
+  // genuinely varies with page size/host load.
+  if (cancelRequested && !isActive) {
+    setCancelRequested(false);
+  }
+
+  const cancelMutation = useMutation({
+    mutationFn: () => documentsApi.cancel(id!),
+    onSuccess: () => {
+      setCancelRequested(true);
+      queryClient.invalidateQueries({ queryKey: ["document", id] });
+    },
+  });
 
   if (progressEvent && progressEvent.status !== document?.status) {
     // Refresh the document record once a stage transition lands so the
@@ -88,8 +108,21 @@ export default function DocumentDetailPage() {
       {isActive && (
         <div className="grid grid-cols-1 lg:grid-cols-3 gap-4 items-start">
           <div className="lg:col-span-2 bg-white rounded-xl border border-slate-200 p-6 space-y-5">
-            <h2 className="font-semibold text-slate-900">Processing</h2>
+            <div className="flex items-center justify-between">
+              <h2 className="font-semibold text-slate-900">Processing</h2>
+              <button
+                type="button"
+                onClick={() => cancelMutation.mutate()}
+                disabled={cancelMutation.isPending || cancelRequested}
+                className="px-3 py-1.5 rounded-lg border border-red-200 text-red-700 text-sm font-medium hover:bg-red-50 disabled:opacity-50 disabled:cursor-not-allowed"
+              >
+                {cancelRequested ? "Stopping…" : "Stop"}
+              </button>
+            </div>
             <ProgressBar percent={currentPercent} label={STAGE_LABELS[currentStage]?.label ?? currentStage} />
+            {cancelMutation.isError && (
+              <p className="text-xs text-red-600">Could not stop this job. Try again.</p>
+            )}
             {progressEvent?.page && <p className="text-xs text-slate-500">Currently on page {progressEvent.page}</p>}
             <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 pt-2">
               {Object.entries(STAGE_LABELS).map(([key, meta]) => {
