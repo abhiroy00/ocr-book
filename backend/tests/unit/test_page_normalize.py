@@ -61,12 +61,19 @@ def test_page_transform_keeps_portrait_for_mild_width_bias():
     assert not transform.is_landscape
 
 
-def test_page_transform_never_upscales_sparse_content():
-    """A title page with a small amount of content must not be blown up
-    to fill the entire A4 safe area (spec step 26)."""
-    words = [_word("Title", 100, 100, 300, 140)]
+def test_page_transform_upscales_sparse_content_to_fill_the_page():
+    """A title page with only a small amount of content must still fill
+    the A4 safe area, not sit tiny in the middle of mostly blank space --
+    confirmed as the wanted behavior against a real title page
+    (2026-09-13): content should fill the page like the rest of the
+    book's pages."""
+    # Content block clears the 10% min-content-fraction in both dimensions
+    # (500x400px on a 2000x3000px page) so this exercises a real small
+    # crop, not the separate "degenerate detection -> keep full page"
+    # fallback path.
+    words = [_word("Title", 100, 100, 600, 500)]
     transform = compute_page_transform(2000, 3000, words, dpi=300)
-    assert transform.scale <= 1.0
+    assert transform.scale > 1.0
 
 
 def test_page_transform_shrinks_oversized_content_to_fit():

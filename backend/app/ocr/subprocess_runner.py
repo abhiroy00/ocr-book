@@ -55,6 +55,19 @@ def _child_main(provider_name: str, task_q: "mp.Queue", result_q: "mp.Queue") ->
     function on a normal OCR error — it reports {"error": ...} back and
     keeps serving the next task; only a signal-level crash (SIGILL/SIGSEGV)
     takes this process down, which the parent observes via `is_alive()`."""
+    import os
+
+    # Same defense-in-depth as `app.workers.page_worker_pool._child_main`
+    # -- must happen before the OCR provider (and whatever native runtime
+    # it loads) is imported below, since OpenMP/MKL/OpenBLAS read these
+    # once at library-load time. This subprocess normally runs alone (one
+    # per document job), but the sequential-fallback path can overlap with
+    # a `PageWorkerPool` still shutting down, so this must never assume
+    # it's the only native-thread-pool-using process on the host.
+    for _env_var in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS", "NUMEXPR_NUM_THREADS", "VECLIB_MAXIMUM_THREADS"):
+        os.environ.setdefault(_env_var, "1")
+    cv2.setNumThreads(1)
+
     from app.ocr.factory import get_ocr_provider
 
     try:

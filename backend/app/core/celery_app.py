@@ -30,6 +30,23 @@ celery_app.conf.update(
     timezone="UTC",
     enable_utc=True,
     worker_concurrency=settings.celery_worker_concurrency,
+    # Two queues, not one: `pipeline.process_document` and
+    # `export.regenerate_document_export` have very different resource
+    # profiles (the former is CPU/RAM-heavy and can run for hours; the
+    # latter is a lightweight, usually-seconds-long DB+file read/write) and
+    # are now consumed by separate worker services (see docker-compose.yml
+    # `worker` vs `export-worker`) so a slow OCR job never blocks a
+    # regenerate/export request behind it in the queue (a real regression
+    # risk introduced by deliberately dropping CELERY_WORKER_CONCURRENCY to
+    # 1 on the pipeline worker -- see that setting's comment in .env). A
+    # worker service consuming only its own queue (`-Q pipeline` /
+    # `-Q export`) still reads this same routing table, so this is the
+    # only place the split needs to be declared.
+    task_routes={
+        "pipeline.process_document": {"queue": "pipeline"},
+        "export.regenerate_document_export": {"queue": "export"},
+    },
+    task_default_queue="pipeline",
     task_acks_late=True,
     worker_prefetch_multiplier=1,
     task_track_started=True,

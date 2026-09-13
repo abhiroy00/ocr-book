@@ -72,7 +72,48 @@ services:
         condition: service_healthy
       backend:
         condition: service_started
-    command: celery -A app.core.celery_app worker -l info --concurrency=${CELERY_WORKER_CONCURRENCY:-2}
+    # `-Q pipeline` only: this worker handles just the heavy OCR pipeline
+    # (see app/core/celery_app.py task_routes). Kept separate from export
+    # tasks so a slow multi-hour OCR job never blocks a regenerate/export
+    # request behind it in the same queue.
+    command: celery -A app.core.celery_app worker -l info -Q pipeline --concurrency=${CELERY_WORKER_CONCURRENCY:-1}
+
+  # Handles only `export.regenerate_document_export` (searchable PDF/DOCX/
+  # Excel/reconstructed-PDF regeneration) -- lightweight, usually
+  # seconds-long, DB+file read/write work with no page-level
+  # multiprocessing of its own. Split into its own service so it stays
+  # responsive even while the main `worker` service is deep into an
+  # hours-long large-document OCR run (that worker's CELERY_WORKER_CONCURRENCY
+  # is deliberately 1 -- see .env -- so without this split, export requests
+  # would queue behind whichever document is currently processing).
+  export-worker:
+    build:
+      context: .
+      dockerfile: docker/backend/Dockerfile
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-docai}:${POSTGRES_PASSWORD:-change-me}@postgres:5432/${POSTGRES_DB:-document_clean_reconstruct}
+      REDIS_URL: redis://redis:6379/0
+      CELERY_BROKER_URL: redis://redis:6379/0
+      CELERY_RESULT_BACKEND: redis://redis:6379/1
+      STORAGE_LOCAL_ROOT: /app/storage
+    volumes:
+      - ./backend:/app/backend
+      - storage_data:/app/storage
+      - paddleocr_models:/root/.paddleocr
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      backend:
+        condition: service_started
+    # --max-tasks-per-child=100 overrides the app-wide default of 1 (see
+    # celery_app.py -- that recycle-per-task exists specifically for the
+    # `page_worker_pool` fork-after-threads risk, which export tasks never
+    # trigger; recycling this worker every single task would only add
+    # avoidable Python/Celery startup latency to every export request).
+    command: celery -A app.core.celery_app worker -l info -Q export --concurrency=2 --max-tasks-per-child=100
 
   frontend:
     build:

@@ -242,7 +242,10 @@ def _run_pipeline(db, storage, document: Document, job: ProcessingJob, lock_toke
     all_page_numbers = list(range(1, total_pages + 1))
 
     num_workers = min(settings.resolved_ocr_workers, total_pages)
-    logger.info("pipeline_parallel_start", document_id=document.id, total_pages=total_pages, ocr_workers=num_workers)
+    logger.info(
+        "pipeline_parallel_start", document_id=document.id, total_pages=total_pages, ocr_workers=num_workers,
+        **settings.ocr_worker_sizing_debug,
+    )
 
     # Controlled worker-pool parallelism (spec: bounded pool, never one
     # process per page). Each pool worker independently renders, cleans,

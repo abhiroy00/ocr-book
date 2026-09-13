@@ -143,11 +143,14 @@ def compute_page_transform(width: int, height: int, words: list[OCRWordResult], 
     available_w = page_w_pt - 2 * _MARGIN_PT
     available_h = page_h_pt - 2 * _MARGIN_PT
 
-    # Cap at 1.0: shrink oversized content to fit, but never blow up a
-    # sparse page (e.g. a title page) to fill the whole safe area -- a
-    # small amount of real content should still look like a small amount
-    # of content on an otherwise-clean A4 page, not a giant enlarged word.
-    scale = min(available_w / content_w_pt, available_h / content_h_pt, 1.0)
+    # No 1.0 cap: always scale content to fill the available A4 area
+    # (aspect ratio preserved -- whichever dimension is tighter, width or
+    # height, determines the scale). A sparse page (e.g. a title page)
+    # previously stayed at its small original size, surrounded by a large
+    # white margin -- confirmed as an unwanted result on a real title page
+    # (2026-09-13): the content should fill the page like the rest of the
+    # book's pages, not sit tiny in the middle of mostly blank space.
+    scale = min(available_w / content_w_pt, available_h / content_h_pt)
 
     scaled_w = content_w_pt * scale
     scaled_h = content_h_pt * scale

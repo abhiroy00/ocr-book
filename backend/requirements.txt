@@ -46,6 +46,12 @@ boto3==1.35.76
 python-slugify==8.0.4
 structlog==24.4.0
 tenacity==9.0.0
+# Reads live available RAM so the OCR worker-pool size can be capped by
+# actual memory headroom, not just a guessed constant (see
+# app.core.config.Settings.resolved_ocr_workers) -- confirmed necessary by
+# a real incident where 4 OCR workers pushed this host's Docker Desktop VM
+# to 6.4/7.5GB and crashed the Docker engine itself.
+psutil==6.1.0
 
 # --- Testing ---
 pytest==8.3.4

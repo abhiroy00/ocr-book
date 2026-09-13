@@ -105,6 +105,40 @@ class Settings(BaseSettings):
     # worker's memory cost (a loaded OCR model) is real, so this must stay
     # a deliberate, bounded number, never one-per-page.
     ocr_workers: int = 0
+    # Upper ceiling used when OCR_WORKERS is left at its auto default (0)
+    # -- the literal throughput target, e.g. 10 on a 14-core host. See
+    # `resolved_ocr_workers`: this is a REQUEST, not a guarantee, since
+    # actual available RAM at pipeline start might not support it.
+    ocr_max_workers: int = 10
+    ocr_min_workers: int = 1
+    # CPU cores held back for Postgres/Redis/the web server/other Celery
+    # concurrency, never handed to the OCR pool.
+    ocr_reserved_cpu: int = 3
+    # RAM held back (MB) for everything else sharing this host (Postgres,
+    # Redis, FastAPI, the Celery worker's own base footprint, OS/Docker
+    # overhead) before computing how many OCR workers fit. 1536MB matches
+    # the measured ~424MB idle celery-worker baseline plus real margin for
+    # the other services.
+    ocr_reserved_memory_mb: int = 1536
+    # Measured, not guessed -- and revised upward after a first, INCOMPLETE
+    # measurement undercounted this. On 2026-09-13: a 4-worker run crashed
+    # a 7.5GB VM at 6.4GB after only ~2 pages/worker (interrupted before
+    # memory finished climbing, implying ~1.5GB/worker -- too low). A
+    # longer, uninterrupted follow-up run (2 workers, 10 full pages, 12GB
+    # VM) reached 9.57GB before plateauing -- (9.57GB - 0.48GB idle
+    # baseline) / 2 workers = ~4.5GB/worker at sustained, warmed-up
+    # steady state (PaddleOCR with en+hi both loaded per worker -- see
+    # PADDLE_OCR_LANGS). Rounded up to 4800MB for margin. Override this if
+    # a different PADDLE_OCR_LANGS configuration changes the real
+    # per-worker footprint on your host -- and prefer a longer measurement
+    # (10+ pages) over a short one: early pages undercount the true cost.
+    ocr_worker_est_memory_mb: int = 4800
+    # False bypasses the RAM-aware calculation below entirely and honors
+    # OCR_WORKERS literally -- an explicit escape hatch for an operator
+    # who has already sized their own host. The default (True) is what
+    # actually prevents "blindly start N workers and OOM" -- the exact
+    # failure mode that crashed this host during testing.
+    ocr_auto_fallback: bool = True
     # Independent, much smaller concurrency cap for NVIDIA AI-fallback
     # calls specifically -- normal OCR parallelism (OCR_WORKERS) must not
     # translate into that many simultaneous external API requests.
@@ -136,25 +170,93 @@ class Settings(BaseSettings):
 
     @property
     def resolved_ocr_workers(self) -> int:
-        """`OCR_WORKERS=0` (the default) picks a bounded, CPU-aware worker
-        count instead of a hardcoded number: half the available cores
-        (rounded down), capped to [1, 6]. Reasoning: each worker is a
-        separate OS process holding its own loaded OCR model (real RAM
-        cost, not just CPU time), so "use every core" would both starve
-        the rest of the container (DB, web server, other concurrent
-        Celery tasks under celery_worker_concurrency) and multiply memory
-        use for a resource this codebase has already had crash/instability
-        problems from under sustained load (see docs/PHASES.md). Half the
-        cores leaves headroom for that contention; 6 is a practical
-        ceiling for CPU-bound OCR because thread/process scheduling
-        overhead and memory bandwidth contention erode the marginal
-        benefit well before most machines' full core count."""
-        if self.ocr_workers > 0:
-            return self.ocr_workers
+        """Safe OCR worker-pool size, computed fresh at pipeline start --
+        bounded by CPU headroom, by *actually measured available RAM*
+        (via psutil), and by a configurable ceiling (OCR_MAX_WORKERS),
+        never by a single trusted number alone.
+
+        Why RAM matters as much as CPU: confirmed by direct measurement
+        (2026-09-13) that CPU was never this host's real constraint (14
+        cores, mostly idle at OCR_WORKERS=1) -- RAM was. 4 real OCR
+        workers pushed a 7.5GB Docker Desktop VM to 6.4GB and crashed the
+        Docker engine itself. Each worker process loads its own PaddleOCR
+        model(s) (real, non-shareable memory, not just CPU time), so
+        "request 10 workers" must be clamped by how many actually fit in
+        whatever RAM is free right now -- which can shift between runs
+        (another job, another service) -- not assumed constant.
+
+        `OCR_WORKERS` (legacy) still works as the requested ceiling when
+        set > 0; `OCR_MAX_WORKERS` is the clearer newer name for the same
+        thing. Sizing is min(requested, cpu_budget, ram_budget), floored
+        at OCR_MIN_WORKERS so a job can always make forward progress.
+        Set OCR_AUTO_FALLBACK=false to skip the RAM check and honor
+        OCR_WORKERS literally -- an explicit escape hatch, not the
+        default, since bypassing this is exactly the "blindly start N
+        workers" failure mode that crashed this host during testing.
+        """
         import os
 
+        requested = self.ocr_workers if self.ocr_workers > 0 else self.ocr_max_workers
+
+        if not self.ocr_auto_fallback:
+            return max(1, requested)
+
         cpu_count = os.cpu_count() or 2
-        return max(1, min(6, cpu_count // 2))
+        cpu_budget = max(1, cpu_count - self.ocr_reserved_cpu)
+
+        try:
+            import psutil
+
+            available_mb = psutil.virtual_memory().available / (1024 * 1024)
+        except Exception:  # noqa: BLE001 - psutil missing/failed: degrade to the old CPU-only heuristic, never crash config loading over this
+            available_mb = None
+
+        if available_mb is None:
+            ram_budget = max(1, min(6, cpu_count // 2))
+        else:
+            usable_mb = max(0.0, available_mb - self.ocr_reserved_memory_mb)
+            ram_budget = max(1, int(usable_mb // self.ocr_worker_est_memory_mb))
+
+        safe = min(requested, cpu_budget, ram_budget)
+        return max(self.ocr_min_workers, safe)
+
+    @property
+    def ocr_worker_sizing_debug(self) -> dict:
+        """The full breakdown behind `resolved_ocr_workers`, for logging
+        at pipeline start (section 15: observability) -- so "why did we
+        get N workers, not the requested ceiling" is answerable from logs
+        alone rather than requiring a live investigation each time."""
+        import os
+
+        requested = self.ocr_workers if self.ocr_workers > 0 else self.ocr_max_workers
+        cpu_count = os.cpu_count() or 2
+        cpu_budget = max(1, cpu_count - self.ocr_reserved_cpu)
+
+        try:
+            import psutil
+
+            available_mb = round(psutil.virtual_memory().available / (1024 * 1024))
+        except Exception:  # noqa: BLE001
+            available_mb = None
+
+        ram_budget = (
+            max(1, min(6, cpu_count // 2))
+            if available_mb is None
+            else max(1, int(max(0, available_mb - self.ocr_reserved_memory_mb) // self.ocr_worker_est_memory_mb))
+        )
+        chosen = self.resolved_ocr_workers
+        limiting_factor = "auto_fallback_disabled" if not self.ocr_auto_fallback else (
+            "requested" if chosen == requested else ("cpu" if chosen == cpu_budget else "ram")
+        )
+        return {
+            "requested": requested,
+            "cpu_count": cpu_count,
+            "cpu_budget": cpu_budget,
+            "available_ram_mb": available_mb,
+            "ram_budget": ram_budget,
+            "chosen": chosen,
+            "limiting_factor": limiting_factor,
+        }
 
 
 @lru_cache

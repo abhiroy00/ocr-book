@@ -145,6 +145,35 @@ def test_detect_and_fail_stale_job_leaves_recently_updated_job_alone(test_db_ses
     assert result.status == DocumentStatus.OCR_PROCESSING
 
 
+def test_reprocessing_clears_a_stale_error_message_from_a_previous_failed_run(test_db_session, tmp_storage, sample_png_bytes):
+    """Regression test for a real bug seen on live data: a document that
+    failed once and was later successfully reprocessed still displayed
+    the OLD failure's error_message forever, because nothing ever cleared
+    it -- `update_job_progress` only ever set it, on the FAILED path.
+    `create_processing_job` (called at the start of every run, including
+    a re-run) must reset it so a stale error never survives into a new
+    attempt."""
+    document, job = document_service.create_document_from_upload(
+        test_db_session, tmp_storage, "a.png", sample_png_bytes, OCRProviderEnum.PADDLEOCR, 300, PreprocessProfileEnum.BALANCED
+    )
+    document_service.update_job_progress(
+        test_db_session, job, ProcessingStage.OCR, 10, DocumentStatus.FAILED, error="Processing stalled: worker died mid-task."
+    )
+    test_db_session.refresh(document)
+    assert document.error_message  # sanity: the failure really did record a message
+
+    new_job = document_service.create_processing_job(
+        test_db_session, document, OCRProviderEnum.PADDLEOCR, 300, PreprocessProfileEnum.BALANCED
+    )
+    test_db_session.refresh(document)
+    assert document.error_message is None
+
+    document_service.update_job_progress(test_db_session, new_job, ProcessingStage.DONE, 100, DocumentStatus.COMPLETED, message="Done")
+    test_db_session.refresh(document)
+    assert document.status == DocumentStatus.COMPLETED
+    assert document.error_message is None
+
+
 def test_update_job_progress_cancelled_sets_finished_at_and_propagates_to_document(test_db_session, tmp_storage, sample_png_bytes):
     """CANCELLED must be treated as a terminal status the same way
     COMPLETED/FAILED are (finished_at set, document.status mirrored) --

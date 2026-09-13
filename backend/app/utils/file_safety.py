@@ -41,9 +41,21 @@ class ValidatedUpload:
 
 
 def sanitize_filename(filename: str) -> str:
-    """Strip any path component and disallowed characters (path traversal guard)."""
-    base = os.path.basename(filename or "")
-    base = base.replace("\\", "_").replace("/", "_")
+    """Strip any path component and disallowed characters (path traversal guard).
+
+    `os.path.basename()` only recognizes the *host OS's* separator -- on
+    this Linux container that's `/` only, so a Windows-style upload name
+    like `..\\..\\windows\\system32\\evil.pdf` (backslash is a perfectly
+    legal filename character on POSIX) passed straight through unsplit,
+    and each backslash-separated segment then got turned into its own
+    `_`-joined chunk instead of being discarded as a directory component
+    (confirmed by a real test failure: it produced
+    `windows_system32_evil.pdf`, not `evil.pdf`). Normalizing `\\` to `/`
+    first makes basename-extraction correct regardless of which
+    separator style the original filename used or which OS this runs on.
+    """
+    normalized = (filename or "").replace("\\", "/")
+    base = os.path.basename(normalized)
     safe = _SAFE_NAME_RE.sub("_", base).strip("._")
     return safe or f"upload_{uuid.uuid4().hex}"
 

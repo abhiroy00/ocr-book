@@ -116,16 +116,26 @@ def test_searchable_page_invisible_text_stays_aligned_with_repositioned_image():
         assert 0 <= rect.y0 <= page.rect.height
 
 
-def test_searchable_page_sparse_title_page_is_not_over_enlarged():
-    """A title page with a small amount of content must still look like a
-    normal book page, not a single word blown up to fill all of A4 (spec
-    step 26)."""
-    words = [_word("BOOK TITLE", 900, 1400, 1300, 1460)]
+def test_searchable_page_sparse_title_page_fills_the_page():
+    """A title page with a valid (non-degenerate) but small content region
+    must be scaled up to fill the A4 safe area, not sit tiny in the middle
+    of mostly blank space -- confirmed as the wanted behavior against a
+    real title page (2026-09-13): content should fill the page like the
+    rest of the book's pages."""
+    # Two normal-height (60px) single-line words, far apart vertically --
+    # like a real title page's title line and a date/publisher line far
+    # below it. Their UNION spans enough of the page to clear the 10%
+    # min-content-fraction in both dimensions (a real, non-degenerate small
+    # crop, not the separate "degenerate detection -> keep full page"
+    # fallback path) while each individual word stays a realistic size.
+    words = [_word("BOOK", 900, 1200, 1200, 1260), _word("TITLE", 900, 1790, 1200, 1850)]
     doc = fitz.open()
     add_searchable_page(doc, _blank_image(width=2400, height=3400), 300, words, None)
 
-    hits = doc[0].search_for("BOOK TITLE")
+    hits = doc[0].search_for("BOOK")
     assert len(hits) == 1
-    # The placed word's height should stay close to its original physical
-    # size (60px at 300dpi = 14.4pt), not be scaled up dramatically.
-    assert hits[0].height < 40
+    # Original physical size would be ~14.4pt (60px at 300dpi); the
+    # content-aware crop here scales by several times to fill the page, so
+    # the placed text must land meaningfully larger than that old,
+    # un-scaled size.
+    assert hits[0].height > 40

@@ -101,7 +101,11 @@ export default function DocumentDetailPage() {
         )}
       </div>
 
-      {document.error_message && (
+      {/* Belt-and-suspenders alongside the backend clearing error_message
+          on a fresh/successful run: never show a leftover message from an
+          earlier failed attempt once the document itself is no longer in
+          an error state. */}
+      {document.error_message && (document.status === "FAILED" || document.status === "CANCELLED") && (
         <div className="rounded-lg bg-red-50 text-red-700 text-sm px-4 py-3">{document.error_message}</div>
       )}
 

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import List, Optional
 
-from sqlalchemy import Float, ForeignKey, Integer, JSON, String
+from sqlalchemy import Float, ForeignKey, Integer, JSON, String, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db.base import Base, TimestampMixin, new_uuid
@@ -12,6 +12,18 @@ class DocumentPage(TimestampMixin, Base):
     """One rendered page of a Document, its images, and its Document JSON (IR)."""
 
     __tablename__ = "document_pages"
+    __table_args__ = (
+        # `upsert_page` (document_service.py) already achieves idempotency
+        # in application code (select-then-insert-or-update, called only
+        # from the pipeline's single-writer result-draining loop -- see
+        # its docstring). This is the DB-level backstop for that
+        # guarantee: if OCR_WORKERS parallelism, a retry path, or a future
+        # change ever introduces a second concurrent writer for the same
+        # page, a raw race (two inserts for the same document_id +
+        # page_number) fails loudly with an IntegrityError instead of
+        # silently producing a duplicate row.
+        UniqueConstraint("document_id", "page_number", name="uq_document_pages_document_id_page_number"),
+    )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_uuid)
     document_id: Mapped[str] = mapped_column(

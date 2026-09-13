@@ -160,6 +160,15 @@ def create_processing_job(
     document.ocr_provider = ocr_provider
     document.dpi = dpi
     document.preprocess_profile = preprocess_profile
+    # A previous run's error is not this run's error -- without clearing
+    # it here, a document that failed once and was later successfully
+    # reprocessed keeps showing its old failure message forever (nothing
+    # else ever clears `error_message`; `update_job_progress` only ever
+    # sets it, on the FAILED/CANCELLED path). Confirmed as a real bug
+    # against live data: a document sitting at status=COMPLETED still
+    # displayed "Processing stalled: no update for over 15 minutes..."
+    # from a run that failed hours earlier.
+    document.error_message = None
     db.commit()
     db.refresh(job)
     return job
@@ -180,6 +189,13 @@ def update_job_progress(
     job.status = status
     if error:
         job.error_message = error
+    elif status == DocumentStatus.COMPLETED:
+        # Defensive clear: the main guard against a stale error message is
+        # `create_processing_job` resetting it at the start of a run, but
+        # clearing it again here too means a document that reaches
+        # COMPLETED is never showing an error, regardless of the path
+        # that got it there.
+        job.error_message = None
     if status == DocumentStatus.PROCESSING and job.started_at is None:
         job.started_at = datetime.now(timezone.utc)
     if status in (DocumentStatus.COMPLETED, DocumentStatus.FAILED, DocumentStatus.CANCELLED):
@@ -190,6 +206,8 @@ def update_job_progress(
         document.status = status
         if error:
             document.error_message = error
+        elif status == DocumentStatus.COMPLETED:
+            document.error_message = None
     db.commit()
 
     publish_progress_sync(

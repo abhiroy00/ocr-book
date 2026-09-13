@@ -107,6 +107,25 @@ def _child_main(
     contract of never raising out of this function for a normal per-page
     error -- only an OS-level crash takes the process down, which the
     parent observes via `is_alive()`."""
+    import os
+
+    # Must happen before numpy/cv2/paddle are imported -- OpenMP/MKL/
+    # OpenBLAS read these once at library-load time, not per-call, so
+    # setting them any later has no effect. Defense-in-depth alongside
+    # `cpu_threads=1` (paddle_engine.py) and `cv2.setNumThreads(1)` below:
+    # those cover the two libraries this codebase calls directly, but
+    # numpy/scipy/scikit-image underneath can link against the same
+    # OpenMP/MKL/OpenBLAS runtimes and default to "use every core" on
+    # their own. With N pool workers each spawning their own full-core
+    # thread pool, the result is the exact oversubscription collapse
+    # already confirmed once in this codebase (2 workers x 10 threads ->
+    # per-page time 4s -> 1150s, see paddle_engine.py) -- pinning every
+    # thread-pool env var to 1 here makes this process-level pool
+    # (N == OCR_WORKERS) the sole source of concurrency, regardless of
+    # what any dependency's own default would otherwise pick.
+    for _env_var in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS", "NUMEXPR_NUM_THREADS", "VECLIB_MAXIMUM_THREADS"):
+        os.environ.setdefault(_env_var, "1")
+
     import cv2
 
     # OpenCV has its own internal thread pool for per-call parallelism
