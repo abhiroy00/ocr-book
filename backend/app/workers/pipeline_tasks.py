@@ -35,7 +35,7 @@ from app.ocr.factory import get_ocr_provider
 from app.ocr.subprocess_runner import IsolatedOCRWorker
 from app.reconstruction import clean_pdf, pdf_renderer, searchable_pdf
 from app.reconstruction.fonts import resolve_body_font_path
-from app.services import document_service
+from app.services import accession_service, document_service
 from app.services.quality import compare_images
 from app.services.storage import get_storage
 from app.services.pdf_ingest import iter_render_pages, render_single_page
@@ -364,6 +364,17 @@ def _run_pipeline(db, storage, document: Document, job: ProcessingJob, lock_toke
 
     document_service.update_job_progress(db, job, ProcessingStage.QUALITY, 95, DocumentStatus.EXPORTING, message="Scoring visual similarity")
     _run_quality_pass(db, storage, document, reconstructed_bytes)
+
+    # Library accession register (cumulative Master Excel, spec sections
+    # 6-8): best-effort bibliographic-metadata extraction from the title
+    # page, appended as one row. Never fails the document -- a metadata
+    # extraction problem must not turn a successfully-OCR'd document into
+    # a FAILED one; `needs_review` on the row itself is how an uncertain
+    # extraction gets surfaced instead.
+    try:
+        accession_service.create_accession_record_for_document(db, document, all_page_jsons, words_by_page)
+    except Exception as exc:  # noqa: BLE001
+        logger.error("accession_record_creation_failed", document_id=document.id, error=str(exc))
 
     document_service.update_job_progress(db, job, ProcessingStage.DONE, 100, DocumentStatus.COMPLETED, message="Done")
     return False

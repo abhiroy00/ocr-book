@@ -139,6 +139,18 @@ class Settings(BaseSettings):
     # actually prevents "blindly start N workers and OOM" -- the exact
     # failure mode that crashed this host during testing.
     ocr_auto_fallback: bool = True
+    # Recycle (restart) each page-worker process after this many pages,
+    # even mid-document -- confirmed necessary by direct measurement
+    # (2026-09-14): a single worker's memory grew unbounded over a long
+    # run (8GB after 68 pages on a real 446-page document, vs. ~4.5GB
+    # after 10 in a short benchmark), degrading per-page OCR time roughly
+    # 10x alongside it (171s/page vs. a clean ~15-17s/page baseline) --
+    # consistent with memory-pressure thrashing, not a one-time model-load
+    # cost. See `app.workers.page_worker_pool.PageWorkerPool`. 25 is a
+    # practical balance: frequent enough to keep memory from compounding
+    # for hours, infrequent enough that the model-reload cost on respawn
+    # (a few seconds) stays a small fraction of total time.
+    ocr_worker_max_pages: int = 25
     # Independent, much smaller concurrency cap for NVIDIA AI-fallback
     # calls specifically -- normal OCR parallelism (OCR_WORKERS) must not
     # translate into that many simultaneous external API requests.
@@ -146,6 +158,16 @@ class Settings(BaseSettings):
     ocr_queue_size: int = 0  # 0 = unbounded (page numbers are cheap; no reason to block submission)
     ocr_task_timeout_seconds: int = 180
     ocr_retry_count: int = 2
+
+    # --- Library accession register (PDF -> DB -> cumulative Master Excel) ---
+    # Auto-generated accession numbers look like "{prefix}-{n}" (e.g.
+    # "D-305"). Configurable because this system may be continuing an
+    # existing physical/manual register that was already at some number
+    # when automation started -- there is no way to derive that starting
+    # point from the documents themselves, so it must be set explicitly
+    # rather than always starting at 1.
+    accession_number_prefix: str = "D"
+    accession_number_start: int = 1
 
     @field_validator("allowed_upload_extensions")
     @classmethod

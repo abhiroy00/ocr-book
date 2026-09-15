@@ -47,6 +47,7 @@ from typing import Iterator
 
 import billiard as mp
 
+from app.core.config import get_settings
 from app.core.logging import get_logger
 from app.models.enums import LayoutBlockType
 from app.schemas.geometry import BBox
@@ -100,13 +101,28 @@ def _child_main(
     profile_value: str,
     task_q: "mp.Queue",
     result_q: "mp.Queue",
+    max_pages: int,
 ) -> None:
     """Pool worker entry point. Loads the OCR engine and layout detector
     once, then serves page numbers off `task_q` until it receives the
-    shutdown sentinel (None). Mirrors `IsolatedOCRWorker._child_main`'s
-    contract of never raising out of this function for a normal per-page
-    error -- only an OS-level crash takes the process down, which the
-    parent observes via `is_alive()`."""
+    shutdown sentinel (None) OR has processed `max_pages` pages, whichever
+    comes first -- at which point it exits cleanly and `PageWorkerPool`
+    replaces it with a fresh process at the same slot (see `results()`).
+
+    This recycling is not optional cleanup: confirmed by direct
+    measurement on a real 446-page document (2026-09-14) that a single
+    long-lived worker's memory climbed to 8GB after only 68 pages (vs.
+    ~4.5GB after 10 in a short benchmark) -- unbounded growth over a long
+    run, not a one-time model-load cost -- and per-page time degraded
+    roughly 10x alongside it (171s/page vs. a clean ~15-17s/page
+    baseline), consistent with memory-pressure thrashing. Recycling
+    periodically resets that growth back to baseline instead of letting it
+    compound for the rest of a large document.
+
+    Mirrors `IsolatedOCRWorker._child_main`'s contract of never raising
+    out of this function for a normal per-page error -- only an OS-level
+    crash takes the process down, which the parent observes via
+    `is_alive()`."""
     import os
 
     # Must happen before numpy/cv2/paddle are imported -- OpenMP/MKL/
@@ -159,6 +175,7 @@ def _child_main(
     layout_detector = LayoutDetector()
     profile = PreprocessProfile(profile_value)
 
+    pages_done = 0
     while True:
         page_number = task_q.get()
         if page_number is None:  # sentinel: shut down
@@ -225,6 +242,11 @@ def _child_main(
             log.error("page_worker_page_failed", page=page_number, error=str(exc))
             result_q.put(PageWorkResult(page_number=page_number, processing_time=time.perf_counter() - start, error=str(exc)))
 
+        pages_done += 1
+        if pages_done >= max_pages:
+            log.info("page_worker_recycling", worker=worker_name, pages_done=pages_done)
+            return  # clean exit -- PageWorkerPool.results() spawns a replacement at this slot
+
 
 def _crop_and_attach_graphic_images(storage, document_id: str, page_number: int, image, layout_results) -> None:
     for i, result in enumerate(layout_results):
@@ -265,11 +287,28 @@ class PageWorkerPool:
         dpi: int,
         profile: PreprocessProfile,
         num_workers: int,
+        max_pages_per_worker: int | None = None,
     ) -> None:
         self.num_workers = max(1, num_workers)
+        # Confirmed by direct measurement (2026-09-14) that a single
+        # worker's memory grows unbounded over a long document (8GB after
+        # 68 pages, vs. ~4.5GB after 10 in a short benchmark), degrading
+        # per-page time roughly 10x alongside it -- see `_child_main`'s
+        # docstring. Recycling each worker after this many pages resets
+        # that growth periodically instead of letting a large (100+ page)
+        # document compound it for hours.
+        settings = get_settings()
+        self.max_pages_per_worker = max_pages_per_worker or settings.ocr_worker_max_pages
+        self._provider_name = provider_name
+        self._document_id = document_id
+        self._file_bytes = file_bytes
+        self._is_pdf = is_pdf
+        self._dpi = dpi
+        self._profile = profile
         self._task_q: "mp.Queue" = mp.Queue()
         self._result_q: "mp.Queue" = mp.Queue()
         self._procs: list[mp.Process] = []
+        self._pages_done_by_worker: dict[str, int] = {}
         self._first_result_pending = True
         # `in_flight` tracks which page each still-alive worker is currently
         # holding, so a crashed worker's page can be identified and retried
@@ -279,14 +318,21 @@ class PageWorkerPool:
         self._in_flight: dict[int, int] = {}  # worker index -> page_number
 
         for i in range(self.num_workers):
-            worker_name = f"pw-{i}"
-            proc = mp.Process(
-                target=_child_main,
-                args=(worker_name, provider_name, document_id, file_bytes, is_pdf, dpi, profile.value, self._task_q, self._result_q),
-                daemon=True,
-            )
-            proc.start()
-            self._procs.append(proc)
+            self._procs.append(self._spawn_worker(i))
+
+    def _spawn_worker(self, index: int) -> "mp.Process":
+        worker_name = f"pw-{index}"
+        self._pages_done_by_worker[worker_name] = 0
+        proc = mp.Process(
+            target=_child_main,
+            args=(
+                worker_name, self._provider_name, self._document_id, self._file_bytes, self._is_pdf,
+                self._dpi, self._profile.value, self._task_q, self._result_q, self.max_pages_per_worker,
+            ),
+            daemon=True,
+        )
+        proc.start()
+        return proc
 
     def submit(self, page_numbers: list[int]) -> None:
         for n in page_numbers:
@@ -295,7 +341,13 @@ class PageWorkerPool:
     def results(self, expected_count: int) -> Iterator[PageWorkResult]:
         """Yields one `PageWorkResult` per submitted page (in completion
         order, NOT page-number order) until `expected_count` results have
-        been produced or every worker has died."""
+        been produced or every worker has died.
+
+        A worker that exits cleanly after hitting `max_pages_per_worker`
+        (not a crash -- see `_child_main`) is replaced with a fresh
+        process at the same slot so pool-level parallelism is maintained
+        for the rest of the document; there is always still more work
+        queued at that point since `submit()` puts every page up front."""
         received = 0
         while received < expected_count:
             if not any(p.is_alive() for p in self._procs):
@@ -310,6 +362,26 @@ class PageWorkerPool:
             self._first_result_pending = False
             received += 1
             yield result
+
+            if received >= expected_count:
+                break  # no more work coming -- nothing left to respawn a worker for
+
+            worker_name = result.worker_name
+            if not worker_name or worker_name not in self._pages_done_by_worker:
+                continue
+            self._pages_done_by_worker[worker_name] += 1
+            if self._pages_done_by_worker[worker_name] < self.max_pages_per_worker:
+                continue
+
+            index = int(worker_name.rsplit("-", 1)[-1])
+            old_proc = self._procs[index]
+            old_proc.join(30)  # the child exits right after this result -- should be near-instant
+            if old_proc.is_alive():
+                logger.warning("page_worker_recycle_did_not_exit_in_time", worker=worker_name)
+                old_proc.terminate()
+                old_proc.join(5)
+            logger.info("page_worker_pool_respawning", worker=worker_name, pages_done=self._pages_done_by_worker[worker_name])
+            self._procs[index] = self._spawn_worker(index)
 
     def shutdown(self) -> None:
         for _ in self._procs:

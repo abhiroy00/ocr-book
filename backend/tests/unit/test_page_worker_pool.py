@@ -79,3 +79,33 @@ def test_pool_shutdown_terminates_all_worker_processes():
     list(pool.results(2))
     pool.shutdown()
     assert pool.alive_count() == 0
+
+
+def test_pool_recycles_a_worker_after_its_page_quota_and_keeps_processing():
+    """Regression test for a real incident (2026-09-14): a single
+    long-lived worker's memory grew unbounded over a large document (8GB
+    after 68 pages vs. ~4.5GB after 10 in a short benchmark), degrading
+    per-page time roughly 10x alongside it. A worker recycled after
+    `max_pages_per_worker` pages must be transparently replaced -- every
+    submitted page still gets a correct result, with no duplicates and no
+    pages lost across the respawn."""
+    pdf_bytes = _make_pdf_bytes(5)
+    pool = PageWorkerPool(
+        "tesseract", "test-doc-e", pdf_bytes, True, 150, PreprocessProfile.FAST, num_workers=1, max_pages_per_worker=2,
+    )
+    original_pid = pool._procs[0].pid
+    try:
+        pool.submit([1, 2, 3, 4, 5])
+        results = list(pool.results(5))
+    finally:
+        pool.shutdown()
+
+    assert sorted(r.page_number for r in results) == [1, 2, 3, 4, 5]
+    assert all(r.error is None for r in results)
+    # 1 worker, quota of 2 pages, 5 pages submitted -> this can only have
+    # succeeded via at least one recycle (a real, different OS process at
+    # the same pw-0 slot); the worker_name itself is stable across a
+    # recycle (see `_spawn_worker`), so the PID is the signal that
+    # actually distinguishes "the same process kept running" from
+    # "an old process exited and a new one took its place".
+    assert pool._procs[0].pid != original_pid

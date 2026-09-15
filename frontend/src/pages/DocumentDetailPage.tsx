@@ -5,6 +5,7 @@ import { documentsApi, fileUrl } from "@/services/api";
 import { useDocumentProgress } from "@/hooks/useDocumentProgress";
 import StatusBadge from "@/components/StatusBadge";
 import ProgressBar from "@/components/ProgressBar";
+import ProcessTimer from "@/components/ProcessTimer";
 
 const STAGE_LABELS: Record<string, { label: string; percent: number }> = {
   upload: { label: "Uploading", percent: 10 },
@@ -44,6 +45,21 @@ export default function DocumentDetailPage() {
   const isActive = !!document && ACTIVE_STATUSES.has(document.status);
   const progressEvent = useDocumentProgress(id, isActive);
 
+  // The Process Timer's start/end timestamps live on ProcessingJob, not
+  // Document (see backend/app/models/processing_job.py) -- reusing that
+  // existing state rather than inventing separate timer bookkeeping.
+  // Fetched once for a completed document (so re-opening it still shows
+  // its final duration -- test scenario H) and polled at the same 3s
+  // cadence as `document`/`pages` while active, which is what actually
+  // delivers `started_at` shortly after the backend sets it and
+  // `finished_at`/`processing_duration_seconds` the moment the job ends.
+  const { data: job, refetch: refetchJob } = useQuery({
+    queryKey: ["processingJob", id],
+    queryFn: () => documentsApi.progress(id!),
+    enabled: !!id,
+    refetchInterval: (q) => (q.state.data && ACTIVE_STATUSES.has(q.state.data.status) ? 3000 : false),
+  });
+
   // Reset the button's own "Stopping…" flag once the document actually
   // leaves an active status, rather than a fixed timeout -- cancellation
   // is cooperative (the current page finishes first, see
@@ -58,6 +74,7 @@ export default function DocumentDetailPage() {
     onSuccess: () => {
       setCancelRequested(true);
       queryClient.invalidateQueries({ queryKey: ["document", id] });
+      queryClient.invalidateQueries({ queryKey: ["processingJob", id] });
     },
   });
 
@@ -65,6 +82,11 @@ export default function DocumentDetailPage() {
     // Refresh the document record once a stage transition lands so the
     // status badge / action buttons stay in sync with the live event.
     refetch();
+    // Same idea for the job record -- this is what gets `started_at` in
+    // front of the timer promptly (right as PROCESSING begins) and
+    // `finished_at`/`processing_duration_seconds` the instant the job
+    // ends, rather than waiting for the next 3s poll tick.
+    refetchJob();
   }
 
   if (!document) {
@@ -84,6 +106,12 @@ export default function DocumentDetailPage() {
             <span className="text-sm text-slate-500">
               {document.page_count} pages · {document.dpi} DPI · {document.ocr_provider} · {document.preprocess_profile}
             </span>
+            {/* Terminal-state duration (test scenario H: re-opening a
+                completed/failed/cancelled document still shows its final
+                processing time, sourced from the backend, not recomputed). */}
+            {!isActive && job && (
+              <ProcessTimer startedAt={job.started_at} finishedAt={job.finished_at} durationSeconds={job.processing_duration_seconds} />
+            )}
           </div>
         </div>
         {document.status === "COMPLETED" && (
@@ -127,6 +155,7 @@ export default function DocumentDetailPage() {
             {cancelMutation.isError && (
               <p className="text-xs text-red-600">Could not stop this job. Try again.</p>
             )}
+            {job && <ProcessTimer startedAt={job.started_at} finishedAt={job.finished_at} durationSeconds={job.processing_duration_seconds} />}
             {progressEvent?.page && <p className="text-xs text-slate-500">Currently on page {progressEvent.page}</p>}
             <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 pt-2">
               {Object.entries(STAGE_LABELS).map(([key, meta]) => {

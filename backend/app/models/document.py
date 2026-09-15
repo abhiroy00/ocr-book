@@ -39,6 +39,16 @@ class Document(TimestampMixin, Base):
 
     storage_original_path: Mapped[str] = mapped_column(String(1024), nullable=False)
 
+    # sha256 of the uploaded file's raw bytes -- duplicate-upload detection
+    # (spec section 9). Nullable (not unique-constrained at the DB level)
+    # so pre-existing rows from before this column existed stay valid;
+    # the actual "is this a duplicate" check is an application-level query
+    # (`document_service.find_document_by_hash`) filtered to
+    # `is_deleted=False`, not a DB constraint, since a duplicate is a
+    # soft, overridable warning ("reprocess anyway?"), not a hard
+    # invariant the database should enforce.
+    document_hash: Mapped[Optional[str]] = mapped_column(String(64), nullable=True, index=True)
+
     is_deleted: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     error_message: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
 

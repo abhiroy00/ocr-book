@@ -1,5 +1,6 @@
 import axios from "axios";
 import type {
+  AccessionSummary,
   DocumentListResponse,
   DocumentRecord,
   DocumentStats,
@@ -200,4 +201,18 @@ export const documentsApi = {
     const { data } = await api.get<QualityReport>(`/documents/${documentId}/quality`);
     return data;
   },
+};
+
+// Library accession register (cumulative Master Excel) -- see
+// backend/app/api/v1/accession.py. Kept as its own small object rather
+// than folded into `documentsApi` since it's a distinct resource (one row
+// per processed document's extracted bibliographic metadata, not a
+// per-document action).
+export const accessionApi = {
+  summary: async () => {
+    const { data } = await api.get<AccessionSummary>("/accession-records/summary");
+    return data;
+  },
+
+  masterExcelUrl: () => `${API_BASE_URL}/accession-records/export/master-excel`,
 };

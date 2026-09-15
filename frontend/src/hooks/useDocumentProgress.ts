@@ -2,7 +2,10 @@ import { useEffect, useRef, useState } from "react";
 import { documentsApi, wsUrlForDocument } from "@/services/api";
 import type { ProgressEvent } from "@/types/document";
 
-const TERMINAL_STATUSES = new Set(["COMPLETED", "FAILED"]);
+// Missing "CANCELLED" here was a real bug: a stopped job never closed its
+// WebSocket / never stopped its polling fallback, both left running for
+// the rest of the component's lifetime.
+const TERMINAL_STATUSES = new Set(["COMPLETED", "FAILED", "CANCELLED"]);
 
 /**
  * Live processing progress (spec section 20): prefers the WebSocket

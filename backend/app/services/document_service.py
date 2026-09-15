@@ -6,6 +6,7 @@ and Celery tasks both go through here rather than touching models directly.
 """
 from __future__ import annotations
 
+import hashlib
 import os
 from datetime import datetime, timezone
 
@@ -33,6 +34,20 @@ from app.tables.models import DetectedTable
 from app.utils.file_safety import sanitize_filename, validate_upload
 
 PAGE_SIZE_DEFAULT = 20
+
+
+def compute_document_hash(content: bytes) -> str:
+    """sha256 of the raw uploaded bytes -- duplicate-upload detection
+    (spec section 9). A pure function of the file content only (not
+    filename/timestamp), so the same PDF re-uploaded under a different
+    name is still recognized as a duplicate."""
+    return hashlib.sha256(content).hexdigest()
+
+
+def find_document_by_hash(db: Session, document_hash: str) -> Document | None:
+    """Never matches a soft-deleted document -- re-uploading something the
+    user explicitly removed is not a duplicate."""
+    return db.scalar(select(Document).where(Document.document_hash == document_hash, Document.is_deleted.is_(False)))
 
 
 # ----------------------------------------------------------------------------
@@ -64,6 +79,7 @@ def create_document_from_upload(
         preprocess_profile=preprocess_profile,
         storage_original_path="",
         uploaded_by=uploaded_by,
+        document_hash=compute_document_hash(content),
     )
     db.add(document)
     db.flush()  # assigns document.id

@@ -94,6 +94,12 @@ export interface ProcessingJob {
   started_at: string | null;
   finished_at: string | null;
   error_message: string | null;
+  // Authoritative total pipeline duration, computed backend-side --
+  // null while the job hasn't started or is still running (the frontend
+  // Process Timer ticks live off `started_at` for that case), populated
+  // once `finished_at` is set (COMPLETED/FAILED/CANCELLED all set this
+  // together -- see `document_service.update_job_progress`).
+  processing_duration_seconds: number | null;
 }
 
 export interface ProgressEvent {
@@ -194,4 +200,13 @@ export interface QualityReport {
   document_id: string;
   pages: QualityPageReport[];
   overall_visual_similarity: number | null;
+}
+
+// Library accession register (cumulative Master Excel) -- see
+// backend/app/services/accession_service.py.
+export interface AccessionSummary {
+  total_records: number;
+  needs_review_count: number;
+  latest_record_date: string | null;
+  total_documents_processed: number;
 }

@@ -49,6 +49,7 @@ async def upload_document(
     ocr_provider: Optional[OCRProviderEnum] = Form(default=None),
     dpi: Optional[int] = Form(default=None),
     preprocess_profile: Optional[PreprocessProfileEnum] = Form(default=None),
+    force: bool = Form(default=False),
     db: Session = Depends(get_db),
     storage: StorageBackend = Depends(get_storage_backend),
     user: Optional[str] = Depends(get_current_user),
@@ -59,6 +60,23 @@ async def upload_document(
     resolved_dpi = dpi or settings.default_dpi
     if resolved_dpi not in settings.allowed_dpi_list:
         raise HTTPException(status_code=422, detail=f"dpi must be one of {settings.allowed_dpi_list}")
+
+    # Duplicate-upload detection (spec section 9): a content-hash match
+    # against an already-processed document is reported back rather than
+    # silently reprocessed -- `force=true` explicitly opts into
+    # reprocessing anyway (the existing reprocess workflow already
+    # supports this need; this just guards the common "oops, uploaded the
+    # same PDF twice" case from creating a second, wasteful full OCR run).
+    if not force:
+        existing = document_service.find_document_by_hash(db, document_service.compute_document_hash(content))
+        if existing is not None:
+            latest_job = db.scalar(
+                select(ProcessingJob).where(ProcessingJob.document_id == existing.id).order_by(ProcessingJob.created_at.desc())
+            )
+            return DocumentUploadResponse(
+                document_id=existing.id, job_id=latest_job.id if latest_job else "", status=existing.status,
+                original_filename=existing.original_filename, page_count=existing.page_count, is_duplicate=True,
+            )
 
     try:
         document, job = document_service.create_document_from_upload(

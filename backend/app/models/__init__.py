@@ -1,3 +1,4 @@
+from app.models.accession_record import AccessionRecord
 from app.models.document import Document
 from app.models.document_page import DocumentPage
 from app.models.export_file import ExportFile
@@ -16,4 +17,5 @@ __all__ = [
     "TableCell",
     "ProcessingJob",
     "ExportFile",
+    "AccessionRecord",
 ]

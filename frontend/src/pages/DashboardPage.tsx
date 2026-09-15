@@ -1,6 +1,6 @@
 import { useQuery } from "@tanstack/react-query";
 import { Link } from "react-router-dom";
-import { documentsApi } from "@/services/api";
+import { accessionApi, documentsApi } from "@/services/api";
 import StatusBadge from "@/components/StatusBadge";
 
 export default function DashboardPage() {
@@ -8,6 +8,11 @@ export default function DashboardPage() {
   const { data: recent } = useQuery({
     queryKey: ["documents", { page: 1, page_size: 5 }],
     queryFn: () => documentsApi.list({ page: 1, page_size: 5 }),
+    refetchInterval: 5000,
+  });
+  const { data: accessionSummary } = useQuery({
+    queryKey: ["accessionSummary"],
+    queryFn: accessionApi.summary,
     refetchInterval: 5000,
   });
 
@@ -67,6 +72,26 @@ export default function DashboardPage() {
             <div className="px-5 py-8 text-center text-slate-400 text-sm">No documents yet — upload your first scan.</div>
           )}
         </div>
+      </div>
+
+      <div className="bg-white rounded-xl border border-slate-200 p-5 flex items-center justify-between flex-wrap gap-4">
+        <div>
+          <h2 className="font-semibold text-slate-900">Library accession register</h2>
+          <p className="text-sm text-slate-500 mt-1">
+            {accessionSummary
+              ? `${accessionSummary.total_records} record${accessionSummary.total_records === 1 ? "" : "s"} from ${accessionSummary.total_documents_processed} document${accessionSummary.total_documents_processed === 1 ? "" : "s"}`
+              : "Cumulative bibliographic data extracted from every processed document."}
+            {!!accessionSummary?.needs_review_count && (
+              <span className="text-amber-600"> · {accessionSummary.needs_review_count} need review</span>
+            )}
+          </p>
+        </div>
+        <a
+          href={accessionApi.masterExcelUrl()}
+          className="px-4 py-2 rounded-lg bg-brand-600 text-white text-sm font-medium hover:bg-brand-700"
+        >
+          Download Master Excel
+        </a>
       </div>
     </div>
   );
