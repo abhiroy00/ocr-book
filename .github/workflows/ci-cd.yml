@@ -1,0 +1,153 @@
+name: CI/CD
+
+# One workflow, not two separate ci.yml/cd.yml files: publish-images
+# needs backend-tests and frontend-checks to have passed, and gating that
+# across separate workflow files (via workflow_run) is more fragile than
+# a single workflow with a `needs:` dependency and an `if:` guard on the
+# same ref. CI (lint/test/build) runs on every push and pull_request; CD
+# (build + publish images) runs only after CI passes, and only for a
+# direct push to main -- never for a PR, so nothing gets published before
+# it's actually merged.
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ci-cd-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  REGISTRY: ghcr.io
+  BACKEND_IMAGE: ghcr.io/${{ github.repository_owner }}/ocr-book-backend
+  FRONTEND_IMAGE: ghcr.io/${{ github.repository_owner }}/ocr-book-frontend
+
+jobs:
+  # ------------------------------------------------------------------
+  # CI: backend
+  # ------------------------------------------------------------------
+  backend-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      # Built from the real backend/app/Dockerfile (the same image
+      # docker-compose's backend/worker/export-worker services run) --
+      # not a hand-rolled `actions/setup-python` + pip install, so CI
+      # exercises the exact same system deps (libgl1, tesseract, ...) and
+      # Python environment production actually runs, with no risk of the
+      # two drifting apart over time. GitHub Actions' own layer cache
+      # (type=gha) makes repeat runs fast despite the image including
+      # heavy ML deps (paddlepaddle/paddleocr).
+      - name: Build backend image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/backend/Dockerfile
+          push: false
+          load: true
+          tags: ocr-book-backend:ci
+          cache-from: type=gha,scope=backend
+          cache-to: type=gha,mode=max,scope=backend
+
+      # Deliberately two separate `docker run` invocations, not one
+      # combined pytest command: tests/unit/test_page_worker_pool.py
+      # spawns real OS worker processes via `billiard`, and a confirmed,
+      # reproduced issue (2026-09-13) is that once *any* earlier test in
+      # the same run has touched threading, forking a new process from
+      # that same Python process can hang indefinitely ("fork-after-
+      # threads" corruption). A fresh `docker run` is a fresh process by
+      # construction, so running this file on its own sidesteps the
+      # whole class of issue rather than working around one symptom of it.
+      - name: Run backend test suite
+        run: docker run --rm ocr-book-backend:ci python -m pytest -q --ignore=tests/unit/test_page_worker_pool.py
+
+      - name: Run page-worker-pool tests (isolated process)
+        run: docker run --rm ocr-book-backend:ci python -m pytest -q tests/unit/test_page_worker_pool.py
+
+  # ------------------------------------------------------------------
+  # CI: frontend
+  # ------------------------------------------------------------------
+  frontend-checks:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+          cache-dependency-path: frontend/package-lock.json
+
+      - run: npm ci
+      - run: npm run lint
+      - run: npm run test -- --run
+      # `build` runs `tsc -b && vite build` (see package.json) -- type
+      # errors fail the build, so this is the type-check too, not just a
+      # bundling smoke test.
+      - run: npm run build
+
+  # ------------------------------------------------------------------
+  # CD: build + publish versioned images to GHCR, main only, after CI
+  # ------------------------------------------------------------------
+  publish-images:
+    needs: [backend-tests, frontend-checks]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - id: meta
+        run: echo "sha_short=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+
+      # Backend/worker/export-worker (docker-compose.yml) all run this
+      # exact same image, just with different commands -- one build
+      # covers all three services.
+      - name: Build and push backend image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/backend/Dockerfile
+          push: true
+          tags: |
+            ${{ env.BACKEND_IMAGE }}:latest
+            ${{ env.BACKEND_IMAGE }}:sha-${{ steps.meta.outputs.sha_short }}
+          cache-from: type=gha,scope=backend
+          cache-to: type=gha,mode=max,scope=backend
+
+      # Static production build served via nginx (docker/frontend/
+      # Dockerfile.prod) -- NOT docker/frontend/Dockerfile, which runs the
+      # Vite dev server and is for local docker-compose use only. The API
+      # URL is baked in at build time (Vite has no runtime env
+      # substitution); the defaults here (relative /api, /ws) only work
+      # behind a reverse proxy sharing the frontend's own origin -- pass
+      # --build-arg VITE_API_BASE_URL=... / VITE_WS_BASE_URL=... for any
+      # other deployment shape.
+      - name: Build and push frontend image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/frontend/Dockerfile.prod
+          push: true
+          tags: |
+            ${{ env.FRONTEND_IMAGE }}:latest
+            ${{ env.FRONTEND_IMAGE }}:sha-${{ steps.meta.outputs.sha_short }}
+          cache-from: type=gha,scope=frontend
+          cache-to: type=gha,mode=max,scope=frontend
