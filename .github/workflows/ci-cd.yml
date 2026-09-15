@@ -151,3 +151,54 @@ jobs:
             ${{ env.FRONTEND_IMAGE }}:sha-${{ steps.meta.outputs.sha_short }}
           cache-from: type=gha,scope=frontend
           cache-to: type=gha,mode=max,scope=frontend
+
+  # ------------------------------------------------------------------
+  # CD: deploy to the server over SSH, after images are published.
+  #
+  # Requires these repo secrets (Settings -> Secrets and variables ->
+  # Actions), none of which exist until you add them -- this job simply
+  # doesn't run (`needs: publish-images` still succeeds; deploy fails
+  # loudly with a clear "bad credentials" error rather than silently) until
+  # they're set:
+  #   EC2_HOST      -- the server's public IP or DNS name
+  #   EC2_SSH_USER   -- "ubuntu" for the Ubuntu AMI this was set up with
+  #   EC2_SSH_KEY    -- the private key's full contents (the .pem file)
+  #
+  # Also requires docker-compose.prod.yml's images to be pullable from the
+  # server: either make the GHCR packages public (Package settings ->
+  # Change visibility -- simplest, matches this repo already being
+  # public) or `docker login ghcr.io` on the server with a PAT that has
+  # read:packages, once, before the first deploy.
+  # ------------------------------------------------------------------
+  deploy:
+    needs: publish-images
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Re-copied on every deploy so a change to docker-compose.prod.yml
+      # itself (a new service, an env var) takes effect automatically --
+      # the server's own copy is never hand-edited. .env is NOT touched
+      # here or anywhere in this workflow -- it stays server-side only,
+      # created once by hand from .env.prod.example, never in git or CI.
+      - name: Copy docker-compose.prod.yml to the server
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ${{ secrets.EC2_SSH_USER }}
+          key: ${{ secrets.EC2_SSH_KEY }}
+          source: "docker-compose.prod.yml"
+          target: "~/ocr-book"
+
+      - name: Pull latest images and restart
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ${{ secrets.EC2_SSH_USER }}
+          key: ${{ secrets.EC2_SSH_KEY }}
+          script: |
+            cd ~/ocr-book
+            docker compose -f docker-compose.prod.yml pull
+            docker compose -f docker-compose.prod.yml up -d
+            docker image prune -f
