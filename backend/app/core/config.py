@@ -169,6 +169,17 @@ class Settings(BaseSettings):
     accession_number_prefix: str = "D"
     accession_number_start: int = 1
 
+    # --- Master Accession Register (persisted, incrementally-appended
+    # workbook -- app.services.accession_register_service) ---
+    # How long a worker waits for another worker's write (load -> append/
+    # update -> sort -> atomic save) to finish before giving up rather
+    # than blocking forever on a peer that may itself be stuck. On
+    # timeout the append is logged and skipped for that document, not
+    # retried automatically -- the DB-backed AccessionRecord it reads from
+    # remains the source of truth, so nothing is lost, just not yet
+    # reflected in the on-disk workbook.
+    master_register_lock_timeout_seconds: float = 30.0
+
     @field_validator("allowed_upload_extensions")
     @classmethod
     def _normalize_ext(cls, v: str) -> str:

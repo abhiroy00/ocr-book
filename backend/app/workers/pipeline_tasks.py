@@ -35,7 +35,7 @@ from app.ocr.factory import get_ocr_provider
 from app.ocr.subprocess_runner import IsolatedOCRWorker
 from app.reconstruction import clean_pdf, pdf_renderer, searchable_pdf
 from app.reconstruction.fonts import resolve_body_font_path
-from app.services import accession_service, document_service
+from app.services import accession_register_service, accession_service, document_service
 from app.services.quality import compare_images
 from app.services.storage import get_storage
 from app.services.pdf_ingest import iter_render_pages, render_single_page
@@ -377,6 +377,20 @@ def _run_pipeline(db, storage, document: Document, job: ProcessingJob, lock_toke
         logger.error("accession_record_creation_failed", document_id=document.id, error=str(exc))
 
     document_service.update_job_progress(db, job, ProcessingStage.DONE, 100, DocumentStatus.COMPLETED, message="Done")
+
+    # Automatic Master Accession Register: append this ONE document to the
+    # persisted, ever-growing workbook now that the job is actually
+    # COMPLETED -- `append_document_record` itself re-checks the job's
+    # status and that a searchable PDF export exists before writing
+    # anything, so this must run after (never before) the line above.
+    # Best-effort like the DB accession record above: a workbook write
+    # problem (lock timeout, disk issue) must not turn a successfully
+    # processed document into a FAILED one.
+    try:
+        accession_register_service.append_document_record(db, document.id)
+    except Exception as exc:  # noqa: BLE001
+        logger.error("master_register_append_failed", document_id=document.id, error=str(exc))
+
     return False
 
 

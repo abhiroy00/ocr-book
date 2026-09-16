@@ -33,6 +33,11 @@ pytesseract==0.3.13
 # --- DOCX ---
 python-docx==1.1.2
 
+# --- Master Accession Register (cross-process file lock for the
+# persisted, incrementally-appended workbook -- see
+# app/core/excel_lock.py) ---
+filelock==3.16.1
+
 # --- XLSX ---
 openpyxl==3.1.5
 
