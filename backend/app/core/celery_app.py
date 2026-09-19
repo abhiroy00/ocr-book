@@ -19,6 +19,7 @@ celery_app = Celery(
     backend=settings.celery_result_backend,
     include=[
         "app.workers.pipeline_tasks",
+        "app.workers.batch_tasks",
         "app.workers.export_tasks",
     ],
 )
@@ -44,6 +45,11 @@ celery_app.conf.update(
     # only place the split needs to be declared.
     task_routes={
         "pipeline.process_document": {"queue": "pipeline"},
+        # Multiple-file OCR shares the pipeline queue and worker on purpose:
+        # a single global worker concurrency then bounds ALL documents in
+        # OCR at once (batch or single), instead of a second pool that could
+        # run alongside it and exhaust RAM.
+        "pipeline.run_batch_slot": {"queue": "pipeline"},
         "export.regenerate_document_export": {"queue": "export"},
     },
     task_default_queue="pipeline",

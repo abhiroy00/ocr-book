@@ -159,6 +159,32 @@ class Settings(BaseSettings):
     ocr_task_timeout_seconds: int = 180
     ocr_retry_count: int = 2
 
+    # --- Multiple-file (batch) OCR -- see app.services.batch_scheduler ---
+    # Upper bound on how many documents may be inside the OCR pipeline at
+    # once on this host. 0 = auto: the scheduler derives an engine-aware
+    # limit from real CPU/RAM (cgroup-aware) at admission time. A positive
+    # value is a CEILING on that auto figure, never a floor -- asking for
+    # more than the host can hold is clamped, not honored, so a mistyped
+    # value cannot OOM the box. It also drives the Celery pipeline worker's
+    # process count in docker-compose (`--concurrency`), so this is the one
+    # knob to turn to scale batch throughput on a bigger instance.
+    ocr_max_concurrency: int = 0
+    # Working-set estimate (MB) of ONE in-flight document for engines that
+    # do not load a heavy local model per pool worker (Tesseract, and the
+    # remote NVIDIA/Ollama engines -- the rest of that job's memory is the
+    # PDF bytes + a few page buffers). Paddle uses OCR_WORKER_EST_MEMORY_MB
+    # instead. Estimate; verify on your own host before relying on it.
+    batch_light_engine_est_memory_mb: int = 700
+    batch_max_files: int = 20
+    # Sum of all files' sizes in one batch -- bounds uncontrolled disk use
+    # (each uploaded original is persisted before processing starts).
+    batch_max_total_mb: int = 2048
+    # Free-disk headroom required before accepting another file, on local
+    # storage: a fixed reserve plus an estimate of the page images one page
+    # of output costs (original + processed PNG per page at 150-300 DPI).
+    batch_disk_reserve_mb: int = 1024
+    batch_disk_mb_per_page: int = 6
+
     # --- Library accession register (PDF -> DB -> cumulative Master Excel) ---
     # Auto-generated accession numbers look like "{prefix}-{n}" (e.g.
     # "D-305"). Configurable because this system may be continuing an

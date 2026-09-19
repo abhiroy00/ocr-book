@@ -29,6 +29,16 @@ storage/output/*
 storage/tmp/*
 !storage/**/.gitkeep
 
+# Same, but for backend/storage/ -- the default STORAGE_LOCAL_ROOT ("./storage")
+# resolves here when the backend runs with its CWD at backend/ (e.g. `pytest`
+# run directly on the host, outside Docker) instead of /app/storage inside the
+# container, and has repeatedly left real test-run image output un-ignored.
+backend/storage/
+
+# Claude Code's own local session config -- personal/machine-specific tool
+# permissions, not project source.
+.claude/
+
 # OCR / model caches
 .paddleocr/
 **/.paddlex/

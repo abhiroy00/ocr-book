@@ -140,6 +140,17 @@ def _release_document_lock(document_id: str, token: str) -> None:
 
 @celery_app.task(bind=True, name="pipeline.process_document")
 def process_document(self, document_id: str, job_id: str) -> str:
+    return run_document_pipeline(self.request.id, document_id, job_id)
+
+
+def run_document_pipeline(task_id: str | None, document_id: str, job_id: str, max_ocr_workers: int | None = None) -> str:
+    """The whole single-document pipeline run, shared by the single-file
+    task above and the multiple-file task (`app.workers.batch_tasks`) so a
+    batched file goes through exactly the same code -- there is one OCR
+    implementation, not two. `max_ocr_workers` is `None` for a single-file
+    upload (behavior unchanged); a batch passes a cap only when several
+    documents run at once, so together they stay within the host's OCR
+    worker budget."""
     db = SessionLocal()
     storage = get_storage()
     lock_token = None
@@ -177,10 +188,10 @@ def process_document(self, document_id: str, job_id: str) -> str:
             )
             return "duplicate_skipped"
 
-        job.celery_task_id = self.request.id
+        job.celery_task_id = task_id
         db.commit()
 
-        cancelled = _run_pipeline(db, storage, document, job, lock_token)
+        cancelled = _run_pipeline(db, storage, document, job, lock_token, max_ocr_workers)
         return "cancelled" if cancelled else "completed"
     except Exception as exc:  # noqa: BLE001 - top-level guard: never leave a job stuck mid-status
         logger.error("pipeline_failed", document_id=document_id, error=str(exc))
@@ -224,7 +235,9 @@ def _on_any_task_failure(sender=None, task_id=None, exception=None, args=None, k
         db.close()
 
 
-def _run_pipeline(db, storage, document: Document, job: ProcessingJob, lock_token: str) -> bool:
+def _run_pipeline(
+    db, storage, document: Document, job: ProcessingJob, lock_token: str, max_ocr_workers: int | None = None
+) -> bool:
     """Returns True if a `/cancel` request stopped the job partway through
     (in which case reconstruction/export never runs and the job is left at
     DocumentStatus.CANCELLED, not FAILED), False if it ran to completion."""
@@ -242,6 +255,8 @@ def _run_pipeline(db, storage, document: Document, job: ProcessingJob, lock_toke
     all_page_numbers = list(range(1, total_pages + 1))
 
     num_workers = min(settings.resolved_ocr_workers, total_pages)
+    if max_ocr_workers:  # batch only: share the host's worker budget across concurrent documents
+        num_workers = max(1, min(num_workers, max_ocr_workers))
     logger.info(
         "pipeline_parallel_start", document_id=document.id, total_pages=total_pages, ocr_workers=num_workers,
         **settings.ocr_worker_sizing_debug,

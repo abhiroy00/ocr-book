@@ -76,7 +76,10 @@ services:
     # (see app/core/celery_app.py task_routes). Kept separate from export
     # tasks so a slow multi-hour OCR job never blocks a regenerate/export
     # request behind it in the same queue.
-    command: celery -A app.core.celery_app worker -l info -Q pipeline --concurrency=${CELERY_WORKER_CONCURRENCY:-1}
+    # OCR_MAX_CONCURRENCY (multiple-file OCR) takes precedence when set;
+    # otherwise CELERY_WORKER_CONCURRENCY (default 1) applies, as before. The
+    # app clamps it to what the host can hold for the chosen engine.
+    command: celery -A app.core.celery_app worker -l info -Q pipeline --concurrency=${OCR_MAX_CONCURRENCY:-${CELERY_WORKER_CONCURRENCY:-1}}
 
   # Handles only `export.regenerate_document_export` (searchable PDF/DOCX/
   # Excel/reconstructed-PDF regeneration) -- lightweight, usually

@@ -79,7 +79,13 @@ services:
         condition: service_healthy
       backend:
         condition: service_started
-    command: celery -A app.core.celery_app worker -l info -Q pipeline --concurrency=${CELERY_WORKER_CONCURRENCY:-1}
+    # OCR_MAX_CONCURRENCY (multiple-file OCR) sets how many documents may be in
+    # OCR at once; unset, it falls back to CELERY_WORKER_CONCURRENCY (default
+    # 1), i.e. exactly the previous behaviour. The app additionally clamps the
+    # value to what this host's RAM/CPU can hold for the chosen engine (see
+    # app/services/batch_scheduler.py; check GET /api/batches/capacity), so an
+    # over-large value cannot OOM the box.
+    command: celery -A app.core.celery_app worker -l info -Q pipeline --concurrency=${OCR_MAX_CONCURRENCY:-${CELERY_WORKER_CONCURRENCY:-1}}
 
   export-worker:
     image: ${BACKEND_IMAGE:-ghcr.io/abhiroy00/ocr-book-backend}:${IMAGE_TAG:-latest}

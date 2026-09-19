@@ -2,6 +2,8 @@ import { useCallback, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import clsx from "clsx";
 import { documentsApi } from "@/services/api";
+import { BatchDropzone, BatchSubmit } from "@/components/BatchUploadPanel";
+import { useBatchUpload } from "@/hooks/useBatchUpload";
 import type { OCRProvider, PreprocessProfile } from "@/types/document";
 
 const ACCEPTED_EXTENSIONS = [".pdf", ".jpg", ".jpeg", ".png", ".webp"];
@@ -43,6 +45,13 @@ export default function UploadPage() {
   const [profile, setProfile] = useState<PreprocessProfile>("FAST");
   const [uploadPercent, setUploadPercent] = useState<number | null>(null);
   const [error, setError] = useState<string | null>(null);
+  // Multiple PDF OCR is a separate mode beside the single-file flow. It
+  // shares the engine/DPI/profile choices below (they apply to the whole
+  // batch); the single-file elements stay mounted (just hidden) in multiple
+  // mode so nothing about that flow -- or a file already picked in it --
+  // changes when you switch tabs.
+  const [mode, setMode] = useState<"single" | "multiple">("single");
+  const batch = useBatchUpload({ accepted: ACCEPTED_EXTENSIONS, ocrProvider, dpi, profile });
 
   const handleFiles = useCallback((files: FileList | null) => {
     if (!files || files.length === 0) return;
@@ -87,7 +96,41 @@ export default function UploadPage() {
         <p className="text-slate-500 mt-1">PDF, JPG, PNG or WebP. Layout, tables and images are preserved during reconstruction.</p>
       </div>
 
+      <div role="tablist" aria-label="Upload mode" className="inline-flex rounded-lg border border-slate-200 bg-white p-1 text-sm">
+        {(
+          [
+            { value: "single", label: "Single File OCR" },
+            { value: "multiple", label: "Multiple PDF OCR" },
+          ] as const
+        ).map((tab) => (
+          <button
+            key={tab.value}
+            role="tab"
+            aria-selected={mode === tab.value}
+            onClick={() => setMode(tab.value)}
+            className={clsx(
+              "px-4 py-1.5 rounded-md font-medium transition-colors",
+              mode === tab.value ? "bg-brand-600 text-white" : "text-slate-600 hover:bg-slate-100",
+            )}
+          >
+            {tab.label}
+          </button>
+        ))}
+      </div>
+
+      {mode === "multiple" && (
+        <BatchDropzone
+          files={batch.files}
+          accepted={ACCEPTED_EXTENSIONS}
+          busy={batch.busy}
+          onAdd={batch.addFiles}
+          onRemove={batch.removeFile}
+          onClear={batch.clear}
+        />
+      )}
+
       <div
+        hidden={mode === "multiple"}
         onDragOver={(e) => {
           e.preventDefault();
           setDragOver(true);
@@ -124,7 +167,10 @@ export default function UploadPage() {
         )}
       </div>
 
-      {error && <div className="rounded-lg bg-red-50 text-red-700 text-sm px-4 py-3">{error}</div>}
+      {error && mode === "single" && <div className="rounded-lg bg-red-50 text-red-700 text-sm px-4 py-3">{error}</div>}
+      {batch.error && mode === "multiple" && (
+        <div className="rounded-lg bg-red-50 text-red-700 text-sm px-4 py-3">{batch.error}</div>
+      )}
 
       <div className="bg-white rounded-xl border border-slate-200 p-5 space-y-5">
         <div>
@@ -179,8 +225,10 @@ export default function UploadPage() {
         </div>
       </div>
 
+      {mode === "multiple" && <BatchSubmit files={batch.files} busy={batch.busy} onSubmit={batch.submit} />}
+
       {uploadPercent !== null && (
-        <div className="bg-white rounded-xl border border-slate-200 p-5">
+        <div hidden={mode === "multiple"} className="bg-white rounded-xl border border-slate-200 p-5">
           <div className="flex justify-between text-sm mb-1">
             <span>Uploading…</span>
             <span>{uploadPercent}%</span>
@@ -192,6 +240,7 @@ export default function UploadPage() {
       )}
 
       <button
+        hidden={mode === "multiple"}
         disabled={!file || uploadPercent !== null}
         onClick={startUpload}
         className="w-full py-3 rounded-lg bg-brand-600 text-white font-medium disabled:opacity-40 hover:bg-brand-700"

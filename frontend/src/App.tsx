@@ -2,6 +2,7 @@ import { Navigate, Route, Routes } from "react-router-dom";
 import Layout from "@/components/Layout";
 import DashboardPage from "@/pages/DashboardPage";
 import UploadPage from "@/pages/UploadPage";
+import BatchPage from "@/pages/BatchPage";
 import DocumentsListPage from "@/pages/DocumentsListPage";
 import DocumentDetailPage from "@/pages/DocumentDetailPage";
 import DocumentPreviewPage from "@/pages/DocumentPreviewPage";
@@ -15,6 +16,7 @@ export default function App() {
         <Route index element={<Navigate to="/dashboard" replace />} />
         <Route path="/dashboard" element={<DashboardPage />} />
         <Route path="/upload" element={<UploadPage />} />
+        <Route path="/batches/:batchId" element={<BatchPage />} />
         <Route path="/documents" element={<DocumentsListPage />} />
         <Route path="/documents/:id" element={<DocumentDetailPage />} />
         <Route path="/documents/:id/preview" element={<DocumentPreviewPage />} />

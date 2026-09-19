@@ -28,6 +28,26 @@ All routes are versioned under `/api` (v1 implicit today; see `app/api/v1`).
 | GET | `/documents/{id}/download/docx` | Download latest DOCX. |
 | GET | `/documents/{id}/quality` | Per-page OCR/layout/table confidence + SSIM similarity score. |
 
+## Batches (Multiple PDF OCR)
+
+Runs several files through the same pipeline as `/documents/upload` above, concurrently where the
+host's CPU/RAM/engine allow it. Every file is still an ordinary `Document` + `ProcessingJob` --
+nothing here replaces the single-file endpoints, which work unchanged.
+
+| Method | Path | Description |
+|---|---|---|
+| POST | `/batches` | Create a batch with one OCR provider / DPI / preprocessing profile for all its files. |
+| GET | `/batches/capacity` | How many documents this host will run at once for a given `?ocr_provider=`, and why (CPU/RAM/API-bound). |
+| POST | `/batches/{id}/files` | Add one file (repeat per file; each request is a normal single-file-sized upload). |
+| POST | `/batches/{id}/start` | Prioritise (smaller files first) and enqueue every added file. |
+| GET | `/batches/{id}` | Batch + per-file status, progress, and the concurrency currently in effect. |
+| GET | `/batches/{id}/items/{job_id}` | One file's status. |
+| POST | `/batches/{id}/items/{job_id}/retry` | Re-queue one failed/cancelled file; the rest of the batch is untouched. |
+| POST | `/batches/{id}/cancel` | Cancel every file not yet finished. |
+
+`OCR_MAX_CONCURRENCY` (env) caps how many files may be in OCR at once; the app clamps it further to
+what the host can actually hold for the chosen engine (see `app/services/batch_scheduler.py`).
+
 ## WebSocket
 
 `ws://.../ws/documents/{id}` — pushes `{stage, percent, page, message}` events as
