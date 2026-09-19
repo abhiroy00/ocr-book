@@ -71,3 +71,13 @@ def export_master_register(db: Session = Depends(get_db)):
             "Cache-Control": "no-store",
         },
     )
+
+
+@router.post("/refresh")
+def refresh_accession_details(db: Session = Depends(get_db)):
+    """Re-read title / creator / year / language for every completed book
+    from its already-stored OCR data (no re-OCR) and rebuild the Master
+    Register with the corrected values. Accession numbers never change.
+    Use after the metadata extractor improves, to fix books processed
+    earlier."""
+    return accession_register_service.refresh_register_details(db)

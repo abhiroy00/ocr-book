@@ -128,3 +128,26 @@ def get_accession_summary(db: Session) -> dict:
         "latest_record_date": latest,
         "total_documents_processed": total_documents,
     }
+
+
+def refresh_metadata_from_stored_ocr(db: Session, document: Document) -> AccessionRecord | None:
+    """Re-reads a document's bibliographic metadata from its ALREADY-STORED
+    layout + OCR data (no re-OCR, no re-processing) and updates its
+    accession row in place -- the accession number and date never change.
+    For books processed before the extractor improved: their rows hold the
+    old, weaker values, and re-uploading a 150-page scan just to re-read
+    its title page would be a needless 40 minutes of OCR.
+
+    Returns the updated record, or None if the document has no stored
+    pages to read."""
+    # Local import: document_service is a much larger module that this
+    # one otherwise has no reason to depend on.
+    from app.services import document_service
+
+    pages = document_service.get_document_json(db, document).pages
+    if not pages:
+        return None
+
+    words_by_id = document_service.get_ocr_words_by_page_for_document(db, document.id)
+    words_by_page = {p.page_number: words_by_id.get(p.page_id, []) for p in pages}
+    return create_accession_record_for_document(db, document, pages, words_by_page)

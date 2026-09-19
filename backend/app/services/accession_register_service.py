@@ -565,6 +565,71 @@ def sync_register_from_db(db: Session) -> int:
     return len(_append_rows(rows, log_duplicates=False))
 
 
+def rebuild_register_from_db(db: Session) -> int:
+    """Rewrites every data row of the register from the database (header
+    and formatting kept) -- a maintenance action for when the DB values
+    behind existing rows changed (e.g. `refresh_register_details`
+    re-read better metadata). Unlike the append-only live path this
+    replaces rows, but nothing is lost: each row is regenerated from the
+    same completed documents. One lock acquisition, one atomic save; on
+    any failure the original file is untouched. Returns the row count."""
+    candidates = db.execute(
+        select(AccessionRecord.document_id)
+        .join(Document, Document.id == AccessionRecord.document_id)
+        .where(Document.is_deleted.is_(False))
+        .order_by(AccessionRecord.record_date, AccessionRecord.accession_number)
+    ).scalars().all()
+    rows = [row for document_id in candidates if (row := _build_eligible_row(db, document_id, log_skips=False)) is not None]
+
+    ensure_master_excel()
+    lock = acquire_lock()
+    try:
+        wb = load_workbook()
+        try:
+            sheet = wb[SHEET_NAME]
+            if sheet.max_row > 1:
+                sheet.delete_rows(2, sheet.max_row - 1)
+            for offset, row in enumerate(rows):
+                _write_row_values(sheet, 2 + offset, row.as_values())
+                autosize_columns(sheet, row.as_values())
+            sort_register(sheet)
+            _apply_auto_filter(sheet)
+            save_atomic(wb)
+        finally:
+            wb.close()
+    finally:
+        release_lock(lock)
+
+    logger.info(f"Rebuilt Master Register with {len(rows)} rows")
+    return len(rows)
+
+
+def refresh_register_details(db: Session) -> dict[str, int]:
+    """Re-reads title / creator / year / language for every completed
+    document from its stored OCR data (no re-OCR -- see
+    `accession_service.refresh_metadata_from_stored_ocr`), then rebuilds
+    the register so it shows the corrected values. Accession numbers are
+    never changed. A document that can't be refreshed keeps its existing
+    values and is counted under `failed`."""
+    from app.services import accession_service
+
+    documents = db.scalars(
+        select(Document).where(Document.is_deleted.is_(False), Document.status == DocumentStatus.COMPLETED)
+    ).all()
+
+    refreshed = failed = 0
+    for document in documents:
+        try:
+            if accession_service.refresh_metadata_from_stored_ocr(db, document) is not None:
+                refreshed += 1
+        except Exception as exc:  # noqa: BLE001 - one bad document must not block the rest
+            db.rollback()
+            failed += 1
+            logger.error("master_register_refresh_failed", document_id=document.id, error=str(exc))
+
+    return {"documents_refreshed": refreshed, "documents_failed": failed, "register_rows": rebuild_register_from_db(db)}
+
+
 def get_master_register_bytes(db: Session) -> bytes:
     """The current Master Register file contents, for download. Syncs any
     missing completed documents in first (best-effort -- a sync failure

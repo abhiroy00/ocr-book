@@ -17,6 +17,7 @@ from dataclasses import dataclass, field
 from app.models.enums import LayoutBlockType
 from app.schemas.document_json import DocumentBlockJSON, PageJSON
 from app.schemas.ocr import OCRWordResult
+from app.services.cover_reader import analyze_cover
 
 # Government/statistical scan titles in this project's real corpus land on
 # page 1-3 (title page, sometimes a blank/publisher page in between) --
@@ -58,18 +59,26 @@ def extract_book_metadata(
     notes: list[str] = []
     needs_review = False
 
+    # Geometry-based cover reading first (rebuilds text lines from OCR
+    # word boxes, so a title the layout detector shattered into one-word
+    # blocks still comes out whole); the older block-type heuristics below
+    # remain as the fallback for anything it can't confidently read.
+    cover = analyze_cover(title_pages, words_by_page)
+
     book_name, title_block = _extract_book_name(title_pages)
+    if cover.title:
+        book_name = cover.title
     if book_name is None:
         book_name = original_filename
         needs_review = True
         notes.append("book_name: no TITLE/HEADING/paragraph text found on the first pages; used the filename")
 
-    creator = _extract_creator(title_pages, title_block)
+    creator = cover.creator or _extract_creator(title_pages, title_block)
     if creator is None:
         needs_review = True
         notes.append("creator: could not confidently identify an author/organization line")
 
-    year = _extract_year(title_pages)
+    year = cover.year or _extract_year(title_pages)
     if year is None:
         needs_review = True
         notes.append("year_of_publication: no plausible year found on the first pages")

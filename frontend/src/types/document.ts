@@ -210,3 +210,10 @@ export interface AccessionSummary {
   latest_record_date: string | null;
   total_documents_processed: number;
 }
+
+// Result of POST /accession-records/refresh (re-read book details from stored OCR).
+export interface AccessionRefreshResult {
+  documents_refreshed: number;
+  documents_failed: number;
+  register_rows: number;
+}
