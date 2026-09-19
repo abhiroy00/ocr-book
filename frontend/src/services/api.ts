@@ -214,5 +214,10 @@ export const accessionApi = {
     return data;
   },
 
+  // Detailed DB-generated export (monthly sheets + document register + summary).
   masterExcelUrl: () => `${API_BASE_URL}/accession-records/export/master-excel`,
+
+  // The single, ever-growing Master Accession Register file -- one row is
+  // appended the moment each book finishes processing.
+  masterRegisterUrl: () => `${API_BASE_URL}/accession-records/export/master-register`,
 };

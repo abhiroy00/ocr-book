@@ -86,12 +86,17 @@ export default function DashboardPage() {
             )}
           </p>
         </div>
-        <a
-          href={accessionApi.masterExcelUrl()}
-          className="px-4 py-2 rounded-lg bg-brand-600 text-white text-sm font-medium hover:bg-brand-700"
-        >
-          Download Master Excel
-        </a>
+        <div className="flex flex-col items-end gap-2">
+          <a
+            href={accessionApi.masterRegisterUrl()}
+            className="px-4 py-2 rounded-lg bg-brand-600 text-white text-sm font-medium hover:bg-brand-700"
+          >
+            Download Master Excel
+          </a>
+          <a href={accessionApi.masterExcelUrl()} className="text-xs text-brand-600 hover:underline">
+            Detailed export (monthly sheets + summary)
+          </a>
+        </div>
       </div>
     </div>
   );

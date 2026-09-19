@@ -14,7 +14,7 @@ from app.api.deps import get_db
 from app.models.document import Document
 from app.exporters.master_register_exporter import render_master_register_excel
 from app.schemas.accession import AccessionRecordListResponse, AccessionRecordRead, AccessionSummary
-from app.services import accession_service
+from app.services import accession_register_service, accession_service
 
 router = APIRouter(prefix="/accession-records", tags=["accession-register"])
 
@@ -51,4 +51,23 @@ def export_master_excel(db: Session = Depends(get_db)):
         content=data,
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         headers={"Content-Disposition": 'attachment; filename="master_extracted_data.xlsx"'},
+    )
+
+
+@router.get("/export/master-register")
+def export_master_register(db: Session = Depends(get_db)):
+    """Download the single, ever-growing Master Accession Register
+    (`storage/master_register/master_accession_register.xlsx`, sheet
+    "Common") -- the same file the pipeline appends a row to the moment
+    each document finishes. Any already-completed document that isn't in
+    it yet (e.g. processed before the register existed) is added first, so
+    the download always contains every completed book."""
+    data = accession_register_service.get_master_register_bytes(db)
+    return Response(
+        content=data,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={
+            "Content-Disposition": 'attachment; filename="master_accession_register.xlsx"',
+            "Cache-Control": "no-store",
+        },
     )
