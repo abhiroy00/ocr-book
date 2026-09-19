@@ -381,7 +381,19 @@ def _latest_searchable_pdf(db: Session, document_id: str) -> tuple[Optional[str]
     return os.path.basename(export.storage_path), export.storage_path
 
 
-def _build_row(record: AccessionRecord, pdf_filename: Optional[str], pdf_path: Optional[str]) -> RegisterRow:
+def _as_naive_utc(moment: Optional[datetime]) -> datetime:
+    """openpyxl can't store tz-aware datetimes -- normalize to naive UTC,
+    falling back to "now" when the job has no recorded finish time."""
+    if moment is None:
+        return datetime.now(timezone.utc).replace(tzinfo=None)
+    if moment.tzinfo is not None:
+        return moment.astimezone(timezone.utc).replace(tzinfo=None)
+    return moment
+
+
+def _build_row(
+    record: AccessionRecord, pdf_filename: Optional[str], pdf_path: Optional[str], processed_at: Optional[datetime]
+) -> RegisterRow:
     return RegisterRow(
         record_date=record.record_date,
         accession_number=record.accession_number,
@@ -392,12 +404,111 @@ def _build_row(record: AccessionRecord, pdf_filename: Optional[str], pdf_path: O
         creator=record.creator,
         pdf_filename=pdf_filename,
         pdf_path=pdf_path,
-        processing_timestamp=datetime.now(timezone.utc).replace(tzinfo=None),
+        processing_timestamp=_as_naive_utc(processed_at),
     )
 
 
+def _build_eligible_row(db: Session, document_id: str, log_skips: bool = True) -> Optional[RegisterRow]:
+    """Builds the register row for `document_id`, or None (logging why, if
+    `log_skips`) unless every precondition holds: the document exists, its
+    most recent `ProcessingJob` is COMPLETED (never FAILED/CANCELLED), it
+    has an `AccessionRecord`, and a `SEARCHABLE_PDF` export exists."""
+    document = db.get(Document, document_id)
+    if document is None:
+        if log_skips:
+            logger.warning("master_register_skipped_missing_document", document_id=document_id)
+        return None
+
+    job = _latest_completed_job(db, document_id)
+    if job is None or job.status != DocumentStatus.COMPLETED:
+        if log_skips:
+            logger.info("master_register_skipped_not_completed", document_id=document_id, status=getattr(job, "status", None))
+        return None
+
+    record = db.scalar(select(AccessionRecord).where(AccessionRecord.document_id == document_id))
+    if record is None:
+        if log_skips:
+            logger.warning("master_register_skipped_missing_accession_record", document_id=document_id)
+        return None
+
+    pdf_filename, pdf_path = _latest_searchable_pdf(db, document_id)
+    if pdf_filename is None:
+        if log_skips:
+            logger.info("master_register_skipped_no_searchable_pdf", document_id=document_id)
+        return None
+
+    return _build_row(record, pdf_filename, pdf_path, job.finished_at)
+
+
+def _read_accession_set() -> set[str]:
+    """Normalized accession numbers already in the register -- read once
+    (read-only, no lock needed: the file is only ever replaced atomically,
+    so a reader sees either the old or the new version, never a torn one)."""
+    path = ensure_master_excel()
+    wb = _openpyxl_load_workbook(path, read_only=True)
+    try:
+        sheet = wb[SHEET_NAME]
+        return {
+            _normalize_accession(value)
+            for (value,) in sheet.iter_rows(min_row=2, min_col=COL_ACCESSION, max_col=COL_ACCESSION, values_only=True)
+            if value
+        }
+    finally:
+        wb.close()
+
+
+def _append_rows(rows: list[RegisterRow], log_duplicates: bool = True) -> list[RegisterRow]:
+    """Under the register's file lock: load once, append every row whose
+    accession number isn't already present, sort, save once (atomically).
+    Returns the rows actually written (empty if all were duplicates, the
+    lock timed out, or the save failed -- the original file is untouched
+    in every one of those cases)."""
+    if not rows:
+        return []
+
+    try:
+        ensure_master_excel()
+        lock = acquire_lock()
+    except Timeout:
+        logger.error("Failed writing register")
+        return []
+
+    try:
+        wb = load_workbook()
+        try:
+            sheet = wb[SHEET_NAME]
+            written: list[RegisterRow] = []
+            for row in rows:
+                if _is_duplicate_in_sheet(sheet, row.accession_number):
+                    if log_duplicates:
+                        logger.info(f"Skipped duplicate accession {row.accession_number}")
+                    continue
+                _write_row_values(sheet, sheet.max_row + 1, row.as_values())
+                autosize_columns(sheet, row.as_values())
+                written.append(row)
+
+            if not written:
+                return []
+
+            sort_register(sheet)
+            _apply_auto_filter(sheet)
+            try:
+                save_atomic(wb)
+            except Exception:
+                logger.error("Failed writing register")
+                return []
+
+            for row in written:
+                logger.info(f"Appended accession {row.accession_number}")
+            return written
+        finally:
+            wb.close()
+    finally:
+        release_lock(lock)
+
+
 # ---------------------------------------------------------------------------
-# Public entry points (called from the pipeline)
+# Public entry points
 # ---------------------------------------------------------------------------
 
 def append_document_record(db: Session, document_id: str) -> bool:
@@ -423,59 +534,113 @@ def append_document_record(db: Session, document_id: str) -> bool:
     DB-backed accession record it reads from. Returns True if a row was
     written, False if skipped (and logged why).
     """
-    document = db.get(Document, document_id)
-    if document is None:
-        logger.warning("master_register_skipped_missing_document", document_id=document_id)
+    row = _build_eligible_row(db, document_id)
+    if row is None:
         return False
+    return bool(_append_rows([row]))
 
-    job = _latest_completed_job(db, document_id)
-    if job is None or job.status != DocumentStatus.COMPLETED:
-        logger.info("master_register_skipped_not_completed", document_id=document_id, status=getattr(job, "status", None))
-        return False
 
-    record = db.scalar(select(AccessionRecord).where(AccessionRecord.document_id == document_id))
-    if record is None:
-        logger.warning("master_register_skipped_missing_accession_record", document_id=document_id)
-        return False
+def sync_register_from_db(db: Session) -> int:
+    """Backfills the register with every already-COMPLETED document that
+    isn't in it yet -- e.g. books processed before this feature was
+    deployed, or a live append that failed at the time (lock timeout, disk
+    hiccup). Same preconditions and duplicate rule as
+    `append_document_record`; safe to call any number of times (a no-op
+    once everything is present). One lock acquisition and one atomic save
+    for the whole batch. Returns how many rows were appended."""
+    present = _read_accession_set()
+    candidates = db.execute(
+        select(AccessionRecord.document_id, AccessionRecord.accession_number)
+        .join(Document, Document.id == AccessionRecord.document_id)
+        .where(Document.is_deleted.is_(False))
+        .order_by(AccessionRecord.record_date, AccessionRecord.accession_number)
+    ).all()
 
-    pdf_filename, pdf_path = _latest_searchable_pdf(db, document_id)
-    if pdf_filename is None:
-        logger.info("master_register_skipped_no_searchable_pdf", document_id=document_id)
-        return False
+    rows = [
+        row
+        for document_id, accession_number in candidates
+        if _normalize_accession(accession_number) not in present
+        and (row := _build_eligible_row(db, document_id, log_skips=False)) is not None
+    ]
+    return len(_append_rows(rows, log_duplicates=False))
 
-    row = _build_row(record, pdf_filename, pdf_path)
 
-    try:
-        ensure_master_excel()
-        lock = acquire_lock()
-    except Timeout:
-        logger.error("Failed writing register", document_id=document_id)
-        return False
+def rebuild_register_from_db(db: Session) -> int:
+    """Rewrites every data row of the register from the database (header
+    and formatting kept) -- a maintenance action for when the DB values
+    behind existing rows changed (e.g. `refresh_register_details`
+    re-read better metadata). Unlike the append-only live path this
+    replaces rows, but nothing is lost: each row is regenerated from the
+    same completed documents. One lock acquisition, one atomic save; on
+    any failure the original file is untouched. Returns the row count."""
+    candidates = db.execute(
+        select(AccessionRecord.document_id)
+        .join(Document, Document.id == AccessionRecord.document_id)
+        .where(Document.is_deleted.is_(False))
+        .order_by(AccessionRecord.record_date, AccessionRecord.accession_number)
+    ).scalars().all()
+    rows = [row for document_id in candidates if (row := _build_eligible_row(db, document_id, log_skips=False)) is not None]
 
+    ensure_master_excel()
+    lock = acquire_lock()
     try:
         wb = load_workbook()
         try:
             sheet = wb[SHEET_NAME]
-
-            if _is_duplicate_in_sheet(sheet, row.accession_number):
-                logger.info(f"Skipped duplicate accession {row.accession_number}", document_id=document_id)
-                return False
-
-            new_row_idx = sheet.max_row + 1
-            _write_row_values(sheet, new_row_idx, row.as_values())
-            autosize_columns(sheet, row.as_values())
+            if sheet.max_row > 1:
+                sheet.delete_rows(2, sheet.max_row - 1)
+            for offset, row in enumerate(rows):
+                _write_row_values(sheet, 2 + offset, row.as_values())
+                autosize_columns(sheet, row.as_values())
             sort_register(sheet)
             _apply_auto_filter(sheet)
-
-            try:
-                save_atomic(wb)
-            except Exception:
-                logger.error("Failed writing register", document_id=document_id)
-                return False
-
-            logger.info(f"Appended accession {row.accession_number}", document_id=document_id)
-            return True
+            save_atomic(wb)
         finally:
             wb.close()
     finally:
         release_lock(lock)
+
+    logger.info(f"Rebuilt Master Register with {len(rows)} rows")
+    return len(rows)
+
+
+def refresh_register_details(db: Session) -> dict[str, int]:
+    """Re-reads title / creator / year / language for every completed
+    document from its stored OCR data (no re-OCR -- see
+    `accession_service.refresh_metadata_from_stored_ocr`), then rebuilds
+    the register so it shows the corrected values. Accession numbers are
+    never changed. A document that can't be refreshed keeps its existing
+    values and is counted under `failed`."""
+    from app.services import accession_service
+
+    documents = db.scalars(
+        select(Document).where(Document.is_deleted.is_(False), Document.status == DocumentStatus.COMPLETED)
+    ).all()
+
+    refreshed = failed = 0
+    for document in documents:
+        try:
+            if accession_service.refresh_metadata_from_stored_ocr(db, document) is not None:
+                refreshed += 1
+        except Exception as exc:  # noqa: BLE001 - one bad document must not block the rest
+            db.rollback()
+            failed += 1
+            logger.error("master_register_refresh_failed", document_id=document.id, error=str(exc))
+
+    return {"documents_refreshed": refreshed, "documents_failed": failed, "register_rows": rebuild_register_from_db(db)}
+
+
+def get_master_register_bytes(db: Session) -> bytes:
+    """The current Master Register file contents, for download. Syncs any
+    missing completed documents in first (best-effort -- a sync failure
+    still serves whatever the file already holds), so the download is
+    always the full, up-to-date register."""
+    try:
+        appended = sync_register_from_db(db)
+        if appended:
+            logger.info("master_register_backfilled", rows=appended)
+    except Exception as exc:  # noqa: BLE001 - never block the download over a backfill problem
+        logger.error("master_register_sync_failed", error=str(exc))
+
+    with open(ensure_master_excel(), "rb") as f:
+        return f.read()

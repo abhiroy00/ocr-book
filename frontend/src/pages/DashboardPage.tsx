@@ -1,9 +1,10 @@
-import { useQuery } from "@tanstack/react-query";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Link } from "react-router-dom";
 import { accessionApi, documentsApi } from "@/services/api";
 import StatusBadge from "@/components/StatusBadge";
 
 export default function DashboardPage() {
+  const queryClient = useQueryClient();
   const { data: stats } = useQuery({ queryKey: ["stats"], queryFn: documentsApi.stats, refetchInterval: 5000 });
   const { data: recent } = useQuery({
     queryKey: ["documents", { page: 1, page_size: 5 }],
@@ -14,6 +15,13 @@ export default function DashboardPage() {
     queryKey: ["accessionSummary"],
     queryFn: accessionApi.summary,
     refetchInterval: 5000,
+  });
+
+  // Re-reads title / creator / year / language for every completed book from
+  // its stored OCR data (no re-OCR) and rebuilds the register.
+  const refreshDetails = useMutation({
+    mutationFn: accessionApi.refresh,
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: ["accessionSummary"] }),
   });
 
   const cards = [
@@ -86,12 +94,31 @@ export default function DashboardPage() {
             )}
           </p>
         </div>
-        <a
-          href={accessionApi.masterExcelUrl()}
-          className="px-4 py-2 rounded-lg bg-brand-600 text-white text-sm font-medium hover:bg-brand-700"
-        >
-          Download Master Excel
-        </a>
+        <div className="flex flex-col items-end gap-2">
+          <a
+            href={accessionApi.masterRegisterUrl()}
+            className="px-4 py-2 rounded-lg bg-brand-600 text-white text-sm font-medium hover:bg-brand-700"
+          >
+            Download Master Excel
+          </a>
+          <a href={accessionApi.masterExcelUrl()} className="text-xs text-brand-600 hover:underline">
+            Detailed export (monthly sheets + summary)
+          </a>
+          <button
+            type="button"
+            onClick={() => refreshDetails.mutate()}
+            disabled={refreshDetails.isPending}
+            className="text-xs text-brand-600 hover:underline disabled:opacity-50"
+          >
+            {refreshDetails.isPending ? "Re-reading book details…" : "Re-read book details"}
+          </button>
+          {refreshDetails.isSuccess && (
+            <span className="text-xs text-emerald-600">
+              Updated {refreshDetails.data.documents_refreshed} book{refreshDetails.data.documents_refreshed === 1 ? "" : "s"} — download again
+            </span>
+          )}
+          {refreshDetails.isError && <span className="text-xs text-red-600">Could not re-read details — try again</span>}
+        </div>
       </div>
     </div>
   );

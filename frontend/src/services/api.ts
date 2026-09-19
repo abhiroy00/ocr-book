@@ -1,5 +1,6 @@
 import axios from "axios";
 import type {
+  AccessionRefreshResult,
   AccessionSummary,
   DocumentListResponse,
   DocumentRecord,
@@ -214,5 +215,17 @@ export const accessionApi = {
     return data;
   },
 
+  // Detailed DB-generated export (monthly sheets + document register + summary).
   masterExcelUrl: () => `${API_BASE_URL}/accession-records/export/master-excel`,
+
+  // The single, ever-growing Master Accession Register file -- one row is
+  // appended the moment each book finishes processing.
+  masterRegisterUrl: () => `${API_BASE_URL}/accession-records/export/master-register`,
+
+  // Re-read title / creator / year / language for every completed book from
+  // its stored OCR data (no re-OCR) and rebuild the register with them.
+  refresh: async () => {
+    const { data } = await api.post<AccessionRefreshResult>("/accession-records/refresh");
+    return data;
+  },
 };

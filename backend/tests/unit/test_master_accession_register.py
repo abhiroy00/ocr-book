@@ -214,3 +214,135 @@ def test_concurrent_lock_holders_never_overlap(tmp_storage):
         t.join(timeout=10)
 
     assert not overlap_detected.is_set()
+
+
+# ---------------------------------------------------------------------------
+# Backfill (books completed before the register existed / failed live appends)
+# and the download route
+# ---------------------------------------------------------------------------
+
+def test_sync_backfills_completed_documents_missing_from_register(test_db_session, tmp_storage, sample_png_bytes):
+    for i in range(3):
+        _make_completed_document(test_db_session, tmp_storage, sample_png_bytes, f"D-{i + 1}", f"Book {i + 1}", f"b{i}.png")
+    failed_doc, failed_job = _make_completed_document(test_db_session, tmp_storage, sample_png_bytes, "D-9", "Failed", "f.png")
+    failed_job.status = DocumentStatus.FAILED
+    test_db_session.commit()
+
+    assert reg.sync_register_from_db(test_db_session) == 3
+
+    sheet = _register_sheet(reg.ensure_master_excel())
+    assert sheet.max_row == 4  # header + the 3 completed books; the FAILED one is not backfilled
+    accessions = {sheet.cell(row=r, column=reg.COL_ACCESSION).value for r in range(2, 5)}
+    assert accessions == {"D-1", "D-2", "D-3"}
+
+
+def test_sync_is_idempotent_and_skips_rows_already_present(test_db_session, tmp_storage, sample_png_bytes):
+    doc_a, _ = _make_completed_document(test_db_session, tmp_storage, sample_png_bytes, "D-1", "Book A", "a.png")
+    _make_completed_document(test_db_session, tmp_storage, sample_png_bytes, "D-2", "Book B", "b.png")
+    assert reg.append_document_record(test_db_session, doc_a.id) is True  # A already in the register
+
+    assert reg.sync_register_from_db(test_db_session) == 1  # only B is missing
+    assert reg.sync_register_from_db(test_db_session) == 0  # nothing left to add
+
+    assert _register_sheet(reg.ensure_master_excel()).max_row == 3
+
+
+def test_sync_ignores_soft_deleted_documents(test_db_session, tmp_storage, sample_png_bytes):
+    document, _ = _make_completed_document(test_db_session, tmp_storage, sample_png_bytes, "D-1", "Book A", "a.png")
+    document.is_deleted = True
+    test_db_session.commit()
+
+    assert reg.sync_register_from_db(test_db_session) == 0
+
+
+def test_get_master_register_bytes_returns_the_full_up_to_date_workbook(test_db_session, tmp_storage, sample_png_bytes):
+    from io import BytesIO
+
+    _make_completed_document(test_db_session, tmp_storage, sample_png_bytes, "D-1", "Book A", "a.png")
+    _make_completed_document(test_db_session, tmp_storage, sample_png_bytes, "D-2", "Book B", "b.png")
+
+    sheet = load_workbook(BytesIO(reg.get_master_register_bytes(test_db_session)))[reg.SHEET_NAME]
+    assert sheet.max_row == 3
+    assert [sheet.cell(row=1, column=c).value for c in range(1, len(reg.HEADERS) + 1)] == reg.HEADERS
+
+
+def test_master_register_download_route(test_db_session, tmp_storage, sample_png_bytes):
+    from io import BytesIO
+
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    from app.api.deps import get_db
+    from app.api.v1 import accession as accession_api
+
+    _make_completed_document(test_db_session, tmp_storage, sample_png_bytes, "D-1", "Book A", "a.png")
+
+    app = FastAPI()
+    app.include_router(accession_api.router, prefix="/api")
+    app.dependency_overrides[get_db] = lambda: test_db_session
+
+    response = TestClient(app).get("/api/accession-records/export/master-register")
+
+    assert response.status_code == 200
+    assert "master_accession_register.xlsx" in response.headers["content-disposition"]
+    sheet = load_workbook(BytesIO(response.content))[reg.SHEET_NAME]
+    assert sheet.cell(row=2, column=reg.COL_ACCESSION).value == "D-1"
+
+
+# ---------------------------------------------------------------------------
+# Refresh: re-read metadata from stored OCR (no re-OCR) and rebuild the register
+# ---------------------------------------------------------------------------
+
+def _store_cover_ocr(db, document, fixture_name):
+    """Stores a real cover's OCR word boxes the way the pipeline does, so
+    `refresh_metadata_from_stored_ocr` has something to re-read."""
+    from tests.unit.test_cover_reader import _load
+
+    pages, words_by_page = _load(fixture_name)
+    cover_page_number = max(words_by_page)
+    for page in pages:
+        db_page = document_service.upsert_page(
+            db, document, page.page_number, int(page.page_width), int(page.page_height), 150, 0.0, document.storage_original_path
+        )
+        words = words_by_page.get(page.page_number, [])
+        for i, word in enumerate(words):
+            word.block_id, word.line_id = f"b{i}", f"l{i}"
+        document_service.persist_page_pipeline_result(db, document, db_page, "x.png", words, [], [])
+    assert cover_page_number >= 1
+
+
+def test_refresh_rereads_better_metadata_and_rebuilds_the_register(test_db_session, tmp_storage, sample_png_bytes):
+    document, job = _make_completed_document(
+        test_db_session, tmp_storage, sample_png_bytes, "D-3", book_name="Studies in", filename="farm.png"
+    )
+    document.status = DocumentStatus.COMPLETED
+    record = test_db_session.query(AccessionRecord).filter_by(document_id=document.id).one()
+    record.creator = "the"  # the old extractor's fragment
+    test_db_session.commit()
+    _store_cover_ocr(test_db_session, document, "farm_management_pali_1973")
+
+    assert reg.append_document_record(test_db_session, document.id) is True  # the stale row, as production has it
+    assert _register_sheet(reg.ensure_master_excel()).cell(row=2, column=reg.COL_BOOK_NAME).value == "Studies in"
+
+    result = reg.refresh_register_details(test_db_session)
+
+    assert result == {"documents_refreshed": 1, "documents_failed": 0, "register_rows": 1}
+    sheet = _register_sheet(reg.ensure_master_excel())
+    assert sheet.max_row == 2  # rebuilt, not duplicated
+    assert sheet.cell(row=2, column=reg.COL_ACCESSION).value == "D-3"  # accession numbers never change
+    assert sheet.cell(row=2, column=reg.COL_BOOK_NAME).value.startswith("Studies in the Economics of Farm Management")
+    assert sheet.cell(row=2, column=reg.COL_CREATOR).value == "Mrs. Kusum Rathore / Bhupal Singh Rathore / Dr. Ram K. Patel"
+    assert sheet.cell(row=2, column=reg.COL_YEAR).value == "1973"
+    assert sheet.cell(row=2, column=reg.COL_PDF_FILENAME).value == "searchable.pdf"
+
+
+def test_refresh_leaves_documents_without_stored_pages_alone(test_db_session, tmp_storage, sample_png_bytes):
+    document, _ = _make_completed_document(test_db_session, tmp_storage, sample_png_bytes, "D-1", "Kept As Is", "a.png")
+    document.status = DocumentStatus.COMPLETED
+    test_db_session.commit()
+
+    result = reg.refresh_register_details(test_db_session)
+
+    assert result["documents_refreshed"] == 0
+    record = test_db_session.query(AccessionRecord).filter_by(document_id=document.id).one()
+    assert record.book_name == "Kept As Is"
