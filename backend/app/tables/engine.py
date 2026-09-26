@@ -50,12 +50,19 @@ def _get_pp_structure():
     return _pp_structure_engine
 
 
-def detect_tables(image: np.ndarray, words: list[OCRWordResult], page_width: int, page_height: int) -> list[DetectedTable]:
+def detect_tables(image: np.ndarray, words: list[OCRWordResult], page_width: int, page_height: int, a4_width_pt: float = 595.2756, a4_height_pt: float = 841.8898) -> list[DetectedTable]:
+    """Detect tables and ensure they stay within A4 boundaries.
+
+    Table bboxes are clamped to A4 dimensions after detection so that
+    large tables always fit within the output page.
+    """
     tables: list[DetectedTable] = []
     claimed: list[BBox] = []
 
     pp_tables = _detect_with_pp_structure(image)
     for t in pp_tables:
+        # Clamp table bbox to A4 boundaries
+        t = _clamp_table_to_a4(t, a4_width_pt, a4_height_pt)
         _fill_cell_text_from_words(t, words)
         tables.append(t)
         claimed.append(t.bbox)
@@ -67,18 +74,69 @@ def detect_tables(image: np.ndarray, words: list[OCRWordResult], page_width: int
         region_words = [w for w in words if _overlaps(w.bbox, region)]
         detected = extract_table_structure(image, region, region_words)
         if detected is not None and detected.n_rows >= 1 and detected.n_cols >= 1:
+            # Clamp table bbox to A4 boundaries
+            detected = _clamp_table_to_a4(detected, a4_width_pt, a4_height_pt)
             tables.append(detected)
-            claimed.append(region)
+            claimed.append(detected.bbox)
 
     remaining_words = [w for w in words if not any(_center_in(w.bbox, c) for c in claimed)]
     fallback_tables = detect_borderless_tables(remaining_words, page_width, page_height)
     for t in fallback_tables:
         if any(_overlaps(t.bbox, c) for c in claimed):
             continue
+        # Clamp table bbox to A4 boundaries
+        t = _clamp_table_to_a4(t, a4_width_pt, a4_height_pt)
+        if any(_overlaps(t.bbox, c) for c in claimed):
+            continue
         tables.append(t)
         claimed.append(t.bbox)
 
     return tables
+
+
+def _clamp_table_to_a4(table: DetectedTable, a4_width_pt: float, a4_height_pt: float) -> DetectedTable:
+    """Ensure a table's bbox fits within A4 boundaries.
+
+    If the table exceeds A4 dimensions, it is proportionally scaled down
+    to fit while maintaining aspect ratio. Row/col structure is preserved.
+    """
+    from app.schemas.geometry import BBox
+    
+    # Get current bbox
+    bbox = table.bbox
+    
+    # Check if table exceeds A4 boundaries
+    if bbox.x2 <= a4_width_pt and bbox.y2 <= a4_height_pt:
+        # Already fits, return as-is
+        return table
+    
+    # Calculate scaling factor to fit within A4
+    # Scale based on the tighter dimension
+    width_ratio = a4_width_pt / max(bbox.x2, 1.0)
+    height_ratio = a4_height_pt / max(bbox.y2, 1.0)
+    scale = min(width_ratio, height_ratio, 1.0)  # Don't scale up if already smaller
+    
+    # Apply scaling to bbox
+    new_x1 = bbox.x1 * scale
+    new_y1 = bbox.y1 * scale
+    new_x2 = bbox.x2 * scale
+    new_y2 = bbox.y2 * scale
+    
+    # Create new table with clamped bbox
+    new_bbox = BBox(x1=max(0, new_x1), y1=max(0, new_y1), x2=min(a4_width_pt, new_x2), y2=min(a4_height_pt, new_y2))
+    
+    # Return new table with clamped bbox
+    from app.tables.models import DetectedTable as DT
+    clamped_table = DT(
+        bbox=new_bbox,
+        n_rows=table.n_rows,
+        n_cols=table.n_cols,
+        confidence=table.confidence,
+        detection_method=table.detection_method,
+        cells=table.cells,
+        border_style=table.border_style,
+    )
+    return clamped_table
 
 
 def _detect_with_pp_structure(image: np.ndarray) -> list[DetectedTable]:
