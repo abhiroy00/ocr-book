@@ -157,16 +157,76 @@ def remove_noise(image: np.ndarray, strength: int = 7) -> np.ndarray:
     return cv2.fastNlMeansDenoisingColored(image, h=strength, hColor=strength, templateWindowSize=7, searchWindowSize=21)
 
 
+def _estimate_background_color(image: np.ndarray) -> tuple[float, float, float]:
+    """Estimate the dominant background color from the image.
+    Returns RGB values in 0-255 range."""
+    gray = _to_gray(image)
+    # Sample corner regions to determine paper color
+    h, w = image.shape[:2]
+    corners = [
+        image[0:min(h//10, h), 0:min(w//10, w)],
+        image[0:min(h//10, h), max(0, w-min(w//10, w)):w],
+        image[max(0, h-min(h//10, h)):h, 0:min(w//10, w)],
+        image[max(0, h-min(h//10, h)):h, max(0, w-min(w//10, w)):w],
+    ]
+    all_pixels = np.vstack([c.reshape(-1, 3) for c in corners if c.size > 0])
+    if all_pixels.size == 0:
+        return (255, 255, 255)
+    # Compute median color of background (exclude dark ink)
+    # Background is typically lighter than text
+    sorted_pixels = np.sort(all_pixels, axis=0)
+    # Take the lighter pixels as background
+    background_color = np.median(sorted_pixels[-500:], axis=0) if len(sorted_pixels) > 500 else np.median(sorted_pixels, axis=0)
+    return tuple(float(c) for c in background_color)
+
+
+def _is_foreground_pixel(gray: np.ndarray, bg_color: tuple, x: int, y: int) -> bool:
+    """Check if a pixel is foreground (text/line) vs background."""
+    if x < 0 or x >= gray.shape[1] or y < 0 or y >= gray.shape[0]:
+        return True
+    pixel_val = gray[y, x]
+    # Foreground is typically darker than background
+    # Allow some tolerance
+    bg_avg = sum(bg_color) / 3
+    return pixel_val < bg_avg * 0.8
+
+
 def remove_background(image: np.ndarray) -> np.ndarray:
     """Flatten uneven scan background (aged paper, shadows, bleed-through)
-    by estimating a large-kernel background surface and dividing it out."""
+    by estimating and removing the background color/tint.
+
+    Adaptive: handles gray, yellow, red, and other paper tints while
+    preserving foreground text and table lines.
+    """
     gray = _to_gray(image)
-    bg = cv2.medianBlur(gray, 51)
-    bg = np.where(bg == 0, 1, bg).astype(np.float32)
-    normalized = (gray.astype(np.float32) / bg) * 255.0
+    bg_color = _estimate_background_color(image)
+
+    # Convert to float for processing
+    float_img = gray.astype(np.float32)
+    bg_float = np.full_like(float_img, sum(bg_color) / 3, dtype=np.float32)
+
+    # Apply adaptive background normalization
+    # Use Gaussian filtering for smoother background estimation
+    bg_blur = cv2.GaussianBlur(float_img, (0, 0), 50)
+    # Avoid division by zero
+    bg_blur = np.where(bg_blur == 0, 1, bg_blur)
+    normalized = (float_img / bg_blur) * 255.0
     normalized = np.clip(normalized, 0, 255).astype(np.uint8)
+
+    # If color image, also normalize channels
     if len(image.shape) == 3:
-        return cv2.cvtColor(normalized, cv2.COLOR_GRAY2BGR)
+        # Process each channel separately for color balance
+        result = image.copy().astype(np.float32)
+        for c in range(3):
+            channel = result[:, :, c].astype(np.float32)
+            bg_ch = bg_color[c]
+            bg_blur_ch = cv2.GaussianBlur(channel, (0, 0), 50)
+            bg_blur_ch = np.where(bg_blur_ch == 0, 1, bg_blur_ch)
+            normalized_ch = (channel / bg_blur_ch) * 255.0
+            normalized_ch = np.clip(normalized_ch, 0, 255).astype(np.uint8)
+            result[:, :, c] = normalized_ch
+        return result
+
     return normalized
 
 
