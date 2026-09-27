@@ -161,6 +161,9 @@ def compute_page_transform(
 
     # Determine portrait vs landscape based on content aspect ratio
     # Landscape only if content is significantly wider than tall
+    # (a common side-effect of a loose content bbox) should stay portrait --
+    # genuinely landscape content (a wide statistical table, a fold-out map)
+    # clears this by a wide margin.
     is_landscape = content_w_pt > content_h_pt * 1.3
 
     a4_width_pt, a4_height_pt = A4_LANDSCAPE_PT if is_landscape else A4_PORTRAIT_PT

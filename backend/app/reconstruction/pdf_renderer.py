@@ -13,9 +13,9 @@ from __future__ import annotations
 
 import fitz  # PyMuPDF
 
+from app.core.config import get_settings
 from app.core.logging import get_logger
 from app.models.enums import LayoutBlockType, TextAlign
-from app.reconstruction.fonts import resolve_body_font_path
 from app.reconstruction.page_transform import (
     compute_page_transform,
     transform_block_to_a4,
@@ -43,54 +43,106 @@ _IMAGE_BLOCK_TYPES = {
 }
 
 
-def render_document_pdf(pages: list[PageJSON]) -> bytes:
-    """Render all pages as A4-sized PDF with proper content normalization.
+def render_document_pdf(pages: list[PageJSON], preserve_original: bool | None = None) -> bytes:
+    """Render all pages as PDF.
 
-    Every output page is exactly A4 size. Block bounding boxes are transformed
-    from original page coordinates to the A4 coordinate system so that content
-    is properly placed regardless of the original scan dimensions.
+    If preserve_original is True (default), output pages preserve the
+    original scanned page dimensions (A4, Letter, Legal, custom sizes).
+    If False, output pages are normalized to A4 size.
+
+    Every page is normalized to A4 size (595.2756 × 841.8898 points for
+    portrait, 841.8898 × 595.2756 for landscape) regardless of the original
+    scanned page dimensions. Block positions are transformed from original
+    coordinates to the A4 coordinate system so that content is properly placed
+    regardless of the original scan dimensions.
     """
+    settings = get_settings()
+    if preserve_original is None:
+        preserve_original = settings.preserve_original_page_size
+
     doc = fitz.open()
     body_font = resolve_body_font_path(bold=False)
     bold_font = resolve_body_font_path(bold=True) or body_font
 
     for page_json in pages:
-        # Compute A4 normalization transform for this page
-        transform = compute_page_transform(
-            page_json.page_width,
-            page_json.page_height,
-            getattr(page_json, "words", []) or [],
-            page_json.dpi,
-        )
+        if preserve_original:
+            # Preserve original page dimensions - do NOT normalize to A4
+            a4_width_pt, a4_height_pt = page_json.page_width, page_json.page_height
+            page = doc.new_page(width=a4_width_pt, height=a4_height_pt)
+            # Render blocks using original coordinates
+            for block in page_json.sorted_blocks():
+                try:
+                    # Use original bbox (not A4-transformed), preserve original mode
+                    _render_block(doc, page, block, page_json, body_font, bold_font,
+                                  block.bbox, preserve_original=True)
+                except Exception as exc:  # noqa: BLE001 - one bad block must not fail the whole page
+                    logger.warning(
+                        "pdf_block_render_failed",
+                        block_id=block.id,
+                        block_type=block.type.value,
+                        error=str(exc),
+                    )
+        else:
+            # Normalize to A4 size (existing behavior)
+            # Compute A4 normalization transform for this page
+            transform = compute_page_transform(
+                page_json.page_width,
+                page_json.page_height,
+                getattr(page_json, "words", []) or [],
+                page_json.dpi,
+            )
 
-        # Determine page orientation based on content aspect ratio
-        is_landscape = transform.is_landscape
-        a4_width, a4_height = A4_LANDSCAPE_PT if is_landscape else A4_PORTRAIT_PT
-        page = doc.new_page(width=a4_width, height=a4_height)
+            # Determine page orientation based on content aspect ratio
+            is_landscape = transform.is_landscape
+            a4_width, a4_height = A4_LANDSCAPE_PT if is_landscape else A4_PORTRAIT_PT
+            page = doc.new_page(width=a4_width, height=a4_height)
 
-        for block in page_json.sorted_blocks():
-            try:
-                # Transform block bbox from original to A4 coordinates
-                a4_bbox = transform_block_to_a4(block, page_json)
+            for block in page_json.sorted_blocks():
+                try:
+                    # Transform block bbox from original to A4 coordinates,
+                    # normalize to A4 mode (existing behavior)
+                    a4_bbox = transform_block_to_a4(block, page_json)
 
-                _render_block(doc, page, block, page_json, body_font, bold_font, a4_bbox)
-            except Exception as exc:  # noqa: BLE001 - one bad block must not fail the whole page
-                logger.warning(
-                    "pdf_block_render_failed",
-                    block_id=block.id,
-                    block_type=block.type.value,
-                    error=str(exc),
-                )
+                    _render_block(doc, page, block, page_json, body_font, bold_font, a4_bbox,
+                                  preserve_original=False)
+                except Exception as exc:  # noqa: BLE001 - one bad block must not fail the whole page
+                    logger.warning(
+                        "pdf_block_render_failed",
+                        block_id=block.id,
+                        block_type=block.type.value,
+                        error=str(exc),
+                    )
 
     pdf_bytes = doc.tobytes(deflate=True, garbage=4)
     doc.close()
     return pdf_bytes
 
 
+def _bbox_to_rect_from_pt(a4_bbox: BBox, dpi: int, page_width_px: int, page_height_px: int) -> "fitz.Rect":
+    """Convert a bounding box from pixel coordinates at given DPI to PDF points,
+    and create a fitz.Rect. This handles both A4-transformed and original coordinate systems.
+    """
+    # Convert pixel bbox to PDF points
+    pt_per_px = 72.0 / dpi
+    x1 = a4_bbox.x1 * pt_per_px
+    y1 = a4_bbox.y1 * pt_per_px
+    x2 = a4_bbox.x2 * pt_per_px
+    y2 = a4_bbox.y2 * pt_per_px
+    return fitz.Rect(x1, y1, x2, y2)
+
+
 def _render_block(doc, page, block: DocumentBlockJSON, page_json: PageJSON,
-                  body_font, bold_font, a4_bbox) -> None:
-    """Render a single block on an A4 page using the transformed bbox."""
-    rect = _bbox_to_rect_from_a4(a4_bbox, page_json)
+                  body_font, bold_font, a4_bbox, preserve_original: bool = False) -> None:
+    """Render a single block on a page using the provided bbox.
+
+    If preserve_original is True, a4_bbox is in original pixel coordinates
+    (converted to PDF points internally). If False, a4_bbox is already in
+    A4 PDF point coordinates (existing behavior).
+    """
+    if preserve_original:
+        rect = _bbox_to_rect_from_pt(a4_bbox, page_json.dpi, page_json.page_width, page_json.page_height)
+    else:
+        rect = _bbox_to_rect_from_a4(a4_bbox, page_json)
 
     if block.type == LayoutBlockType.TABLE and block.table:
         _render_table(page, block, page_json, body_font)

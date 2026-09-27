@@ -95,17 +95,12 @@ class Settings(BaseSettings):
     # --- Workers ---
     celery_worker_concurrency: int = 4
 
-    # --- Page-level OCR parallelism (controlled worker pool, not one
-    # process per page -- see app.workers.page_worker_pool) ---
-    # 0 means "pick a sensible default from CPU count at pipeline start"
-    # (see Settings.resolved_ocr_workers) rather than hardcoding a number
-    # here that would be wrong on both a 2-core laptop and a 32-core
-    # server. PaddleOCR/OpenCV work is CPU-bound native code with no GIL
-    # release, so this pool is process-based, not thread-based -- each
-    # worker's memory cost (a loaded OCR model) is real, so this must stay
-    # a deliberate, bounded number, never one-per-page.
-    ocr_workers: int = 0
-    # Upper ceiling used when OCR_WORKERS is left at its auto default (0)
+# --- Page size / reconstruction ---
+# Preserve original page dimensions by default (do NOT force A4 by default).
+# Set to False to normalize all output pages to A4 (optional mode).
+preserve_original_page_size: bool = True
+
+# Upper ceiling used when OCR_WORKERS is left at its auto default (0)
     # -- the literal throughput target, e.g. 10 on a 14-core host. See
     # `resolved_ocr_workers`: this is a REQUEST, not a guarantee, since
     # actual available RAM at pipeline start might not support it.

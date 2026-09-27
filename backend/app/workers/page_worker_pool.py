@@ -215,7 +215,7 @@ def _child_main(
                 tables = []
 
             layout_results = layout_detector.detect(processed_image, rendered.image, words, tables, rendered.width, rendered.height)
-            _crop_and_attach_graphic_images(storage, document_id, page_number, processed_image, layout_results)
+            _crop_and_attach_graphic_images(storage, document_id, page_number, rendered.image, processed_image, layout_results)
 
             log.info(
                 "page_worker_completed", worker=worker_name, page=page_number,
@@ -248,15 +248,15 @@ def _child_main(
             return  # clean exit -- PageWorkerPool.results() spawns a replacement at this slot
 
 
-def _crop_and_attach_graphic_images(storage, document_id: str, page_number: int, image, layout_results) -> None:
+def _crop_and_attach_graphic_images(storage, document_id: str, page_number: int, original_image, processed_image, layout_results) -> None:
     for i, result in enumerate(layout_results):
         if result.block_type not in _GRAPHIC_TYPES:
             continue
         x1, y1 = max(0, int(result.bbox.x1)), max(0, int(result.bbox.y1))
-        x2, y2 = min(image.shape[1], int(result.bbox.x2)), min(image.shape[0], int(result.bbox.y2))
+        x2, y2 = min(original_image.shape[1], int(result.bbox.x2)), min(original_image.shape[0], int(result.bbox.y2))
         if x2 <= x1 or y2 <= y1:
             continue
-        crop = image[y1:y2, x1:x2]
+        crop = original_image[y1:y2, x1:x2]  # Crop from original, NOT processed
         rel_path = f"processed/{document_id}/page_{page_number:04d}_block_{i:04d}.png"
         storage.write(rel_path, _encode_png(crop))
         result.image_ref = rel_path
