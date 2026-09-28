@@ -104,6 +104,24 @@ class LayoutDetector:
             results.append(LayoutBlockResult(block_type=block_type, bbox=line.bbox, confidence=0.7))
 
         graphic_regions = detect_graphic_regions(original_image, words, excluded, page_width, page_height)
+        graphic_regions = _suppress_nested_graphic_regions(graphic_regions)
+
+        # A map/photo/figure is inserted into the reconstructed output as
+        # one embedded image, cropped straight from the processed page —
+        # so any hand-lettered labels inside it (village names on a map,
+        # captions baked into a photo, ...) are ALREADY present as pixels
+        # in that crop. OCR still recognizes some of that lettering as
+        # text (often poorly, since it's small/hand-drawn/rotated), and
+        # without this filter it was ALSO kept as its own paragraph/
+        # heading block — rendered a second time, as real text, layered
+        # on top of the image at its own (differently-sized) box. The
+        # result: correct pixels underneath, garbled duplicate OCR text
+        # overlapping them on top. Tables already get the equivalent
+        # protection via `free_words` above; this is the same idea,
+        # applied after the fact because graphic regions aren't known
+        # until pixel analysis runs, later than text grouping.
+        results = _drop_text_blocks_inside_graphics(results, graphic_regions)
+
         for region in graphic_regions:
             results.append(
                 LayoutBlockResult(block_type=region.block_type, bbox=region.bbox, confidence=region.confidence)
@@ -265,3 +283,49 @@ def _overlap_ratio(a: BBox, b: BBox) -> float:
 def _center_in(bbox: BBox, container: BBox) -> bool:
     cx, cy = (bbox.x1 + bbox.x2) / 2, (bbox.y1 + bbox.y2) / 2
     return container.x1 <= cx <= container.x2 and container.y1 <= cy <= container.y2
+
+
+# ----------------------------------------------------------------------------
+# Graphic-region cleanup (spec: a label/caption physically ON a map/photo is
+# already present as pixels in that image's crop; keeping OCR's own,
+# typically low-quality, reading of it as a SEPARATE text block draws a
+# garbled duplicate on top of the correct picture).
+# ----------------------------------------------------------------------------
+
+_TEXT_RESULT_TYPES = {
+    LayoutBlockType.TITLE, LayoutBlockType.HEADING, LayoutBlockType.SUBHEADING, LayoutBlockType.PARAGRAPH,
+    LayoutBlockType.HEADER, LayoutBlockType.FOOTER, LayoutBlockType.FOOTNOTE, LayoutBlockType.PAGE_NUMBER,
+}
+# How much of a candidate block's own area must fall inside a graphic
+# region before it's treated as "part of that picture" rather than its
+# own, separately-reconstructed element. Not 1.0: a label box sitting
+# right at a map's ragged hand-drawn edge often pokes a few pixels past
+# it in the OCR's own bounding box.
+_GRAPHIC_CONTAINMENT_THRESHOLD = 0.6
+
+
+def _drop_text_blocks_inside_graphics(results: list[LayoutBlockResult], graphic_regions: list) -> list[LayoutBlockResult]:
+    if not graphic_regions:
+        return results
+    return [
+        r for r in results
+        if r.block_type not in _TEXT_RESULT_TYPES
+        or not any(_overlap_ratio(r.bbox, region.bbox) >= _GRAPHIC_CONTAINMENT_THRESHOLD for region in graphic_regions)
+    ]
+
+
+def _suppress_nested_graphic_regions(regions: list) -> list:
+    """Drops a smaller graphic region that sits mostly inside a larger one
+    (e.g. a dense ink cluster inside a full-page map misclassified as its
+    own small signature/stamp) — its pixels are already covered by the
+    bigger region's own image crop, so keeping it would only draw the same
+    area a second time."""
+    if len(regions) <= 1:
+        return regions
+    by_area_desc = sorted(regions, key=lambda r: (r.bbox.x2 - r.bbox.x1) * (r.bbox.y2 - r.bbox.y1), reverse=True)
+    kept: list = []
+    for region in by_area_desc:
+        if any(_overlap_ratio(region.bbox, bigger.bbox) >= _GRAPHIC_CONTAINMENT_THRESHOLD for bigger in kept):
+            continue
+        kept.append(region)
+    return kept

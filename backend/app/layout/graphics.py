@@ -22,6 +22,21 @@ from app.schemas.ocr import OCRWordResult
 MIN_REGION_AREA_RATIO = 0.002
 MAX_REGION_AREA_RATIO = 0.35
 
+# A real page essentially never carries more than a handful of genuine ink
+# rubber-stamps (confirmed against this project's own real corpus: ~146
+# STAMP blocks across a 206-page document, well under 1 per page on
+# average). Crossing this on a single page is a confirmed real failure
+# mode instead: a dense numeric table on badly-degraded/typewriter-font
+# scans where OCR recognizes only a handful of words, and the small ink
+# blob left behind by EACH unrecognized digit cluster/table cell —
+# near-identical in size, since they're all one row height — gets
+# classified as its own "stamp" one at a time. Rendering dozens of
+# meaningless single-cell image crops in place of a table's numbers makes
+# the reconstructed page actively worse than leaving that area blank, so
+# past this count they are dropped instead of kept (see
+# `_drop_excess_stamp_regions`).
+MAX_PLAUSIBLE_STAMPS_PER_PAGE = 8
+
 
 @dataclass
 class GraphicRegion:
@@ -69,7 +84,15 @@ def detect_graphic_regions(
         block_type, confidence = _classify_region(bbox, region_words, page_width, page_height)
         regions.append(GraphicRegion(bbox=bbox, block_type=block_type, confidence=confidence))
 
-    return regions
+    return _drop_excess_stamp_regions(regions)
+
+
+def _drop_excess_stamp_regions(regions: list[GraphicRegion]) -> list[GraphicRegion]:
+    stamps = [r for r in regions if r.block_type == LayoutBlockType.STAMP]
+    if len(stamps) <= MAX_PLAUSIBLE_STAMPS_PER_PAGE:
+        return regions
+    excess = {id(r) for r in stamps}
+    return [r for r in regions if id(r) not in excess]
 
 
 def _classify_region(
