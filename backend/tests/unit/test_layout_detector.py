@@ -157,3 +157,39 @@ def test_suppress_nested_graphic_regions_keeps_non_overlapping_regions():
     kept = _suppress_nested_graphic_regions([left, right])
 
     assert {r.bbox.x1 for r in kept} == {0.0, 900.0}
+
+
+def test_dense_small_text_is_not_swallowed_as_an_image_when_frames_match():
+    """Regression for a confirmed real-world defect: a dense two-column
+    abbreviations list (498 OCR words) was rendered as only 9 layout
+    blocks, 7 of them "image" -- almost the entire list got swallowed as
+    a graphic instead of real text. Root cause (fixed in
+    `page_worker_pool.py`/`pipeline_tasks.py`, not here): OCR runs on the
+    PROCESSED (deskewed) page, but graphics detection was being given the
+    RAW pre-deskew page for its "original_image" argument. Comparing OCR
+    word boxes against graphic candidate regions computed in a DIFFERENT
+    coordinate frame makes `detect_graphic_regions`'s own "is this mostly
+    text?" self-check (`_text_area_coverage`) read as near-zero even
+    over real, dense text, so the whole block gets kept as a spurious
+    IMAGE instead of excluded.
+
+    This test locks in the invariant the fix depends on: given the SAME
+    image for both the layout/OCR frame and the graphics-detection frame
+    (as both real call sites now always pass), a dense cluster of real
+    text is correctly read as text, not absorbed into an image block.
+    """
+    page_w, page_h = 800, 1000
+    image = np.full((page_h, page_w, 3), 255, dtype=np.uint8)
+
+    words = []
+    for row, y in enumerate(range(100, 500, 20)):
+        for col, x in enumerate(range(80, 700, 140)):
+            text = f"ABBR{row}{col}"
+            x2, y2 = x + 60, y + 12
+            cv2.rectangle(image, (x, y), (x2, y2), (0, 0, 0), thickness=-1)
+            words.append(_word(text, x, y, x2, y2, f"b{row}", f"l{row}{col}"))
+
+    results = LayoutDetector().detect(image, image, words, tables=[], page_width=page_w, page_height=page_h)
+
+    text_word_count = sum(len(r.text.split()) for r in results if r.block_type != LayoutBlockType.IMAGE)
+    assert text_word_count >= len(words) * 0.9  # the list survives as text, not as an image block

@@ -457,7 +457,17 @@ def _run_sequential_fallback(
 
                 words = _run_ocr_page(ocr_worker, processed_image, page_number, dpi)
                 tables = _detect_tables_safely(processed_image, words, rendered.width, rendered.height)
-                layout_results = layout_detector.detect(processed_image, rendered.image, words, tables, rendered.width, rendered.height)
+                # Both args must be `processed_image`, not `rendered.image`
+                # (the pre-deskew/pre-crop raw scan): OCR ran on
+                # `processed_image`, so `words` bboxes are already in its
+                # coordinate frame. Passing the raw scan here put graphic-
+                # region bboxes in a DIFFERENT (un-rotated) frame, so
+                # cropping them out of `processed_image` afterward grabbed
+                # a skewed/misaligned rectangle whenever a page actually
+                # needed deskewing -- confirmed against real output: a map
+                # rendered rotated within its own crop, with black wedge
+                # corners where the rotation didn't fill the rectangle.
+                layout_results = layout_detector.detect(processed_image, processed_image, words, tables, rendered.width, rendered.height)
                 _crop_and_attach_graphic_images(storage, document.id, page_number, processed_image, layout_results)
 
                 result = PageWorkResult(
