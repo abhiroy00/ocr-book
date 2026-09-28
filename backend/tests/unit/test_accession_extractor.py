@@ -63,7 +63,7 @@ def test_creator_is_none_when_nothing_plausible_is_present():
     result = extract_book_metadata("fallback.pdf", [page])
     assert result.creator is None
     assert result.needs_review is True
-    assert any("creator" in n for n in result.notes)
+    assert any("author" in n and "publisher" in n for n in result.notes)
 
 
 def test_extracts_a_plain_four_digit_year():

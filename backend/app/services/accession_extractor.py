@@ -36,7 +36,8 @@ _LANGUAGE_LABELS = {"en": "ENGLISH", "hi": "HINDI", "num": "NUMERICAL"}
 @dataclass
 class ExtractedMetadata:
     book_name: str
-    creator: str | None
+    author: str | None
+    publisher: str | None
     language: str | None
     year_of_publication: str | None
     needs_review: bool = False
@@ -45,6 +46,16 @@ class ExtractedMetadata:
     @property
     def notes_text(self) -> str | None:
         return "; ".join(self.notes) if self.notes else None
+
+    @property
+    def creator(self) -> str | None:
+        """Backward-compatible combined value: the DB-backed register's
+        `AccessionRecord.creator` column and the "Organisation / Author
+        Name" column in `master_register_exporter`'s detailed export both
+        predate the author/publisher split and want a single string --
+        personal author preferred, falling back to the publisher/issuing
+        body."""
+        return self.author or self.publisher
 
 
 def extract_book_metadata(
@@ -73,10 +84,17 @@ def extract_book_metadata(
         needs_review = True
         notes.append("book_name: no TITLE/HEADING/paragraph text found on the first pages; used the filename")
 
-    creator = cover.creator or _extract_creator(title_pages, title_block)
-    if creator is None:
+    author = cover.author
+    publisher = cover.publisher
+    if author is None and publisher is None:
+        # Older, block-type-based heuristic (not geometry-aware) -- its
+        # own docstring shows it mainly targets publisher/issuing-body
+        # style lines, so it fills the publisher slot when the cover
+        # reader found neither.
+        publisher = _extract_creator(title_pages, title_block)
+    if author is None and publisher is None:
         needs_review = True
-        notes.append("creator: could not confidently identify an author/organization line")
+        notes.append("author/publisher: could not confidently identify an author or issuing-body line")
 
     year = cover.year or _extract_year(title_pages)
     if year is None:
@@ -89,7 +107,7 @@ def extract_book_metadata(
         notes.append("language: not enough OCR text to classify")
 
     return ExtractedMetadata(
-        book_name=book_name, creator=creator, language=language, year_of_publication=year,
+        book_name=book_name, author=author, publisher=publisher, language=language, year_of_publication=year,
         needs_review=needs_review, notes=notes,
     )
 

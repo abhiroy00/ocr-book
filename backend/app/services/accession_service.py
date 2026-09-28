@@ -66,6 +66,8 @@ def create_accession_record_for_document(
         record = existing
         record.book_name = metadata.book_name
         record.creator = metadata.creator
+        record.author = metadata.author
+        record.publisher = metadata.publisher
         record.language = metadata.language
         record.year_of_publication = metadata.year_of_publication
         record.total_pages = document.page_count
@@ -77,6 +79,8 @@ def create_accession_record_for_document(
             accession_number=accession_number or generate_next_accession_number(db),
             book_name=metadata.book_name,
             creator=metadata.creator,
+            author=metadata.author,
+            publisher=metadata.publisher,
             language=metadata.language,
             year_of_publication=metadata.year_of_publication,
             total_pages=document.page_count,

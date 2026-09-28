@@ -34,7 +34,6 @@ import os
 import re
 from contextlib import suppress
 from dataclasses import dataclass
-from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -63,37 +62,33 @@ REGISTER_FILENAME = "master_accession_register.xlsx"
 REGISTER_RELATIVE_PATH = f"{REGISTER_DIR}/{REGISTER_FILENAME}"
 SHEET_NAME = "Common"
 
-# Exact column order requested for this register -- distinct from (a
-# differently-shaped set of columns than) the DB-backed register's own
-# sheet, which is why this lives in its own module/file rather than
-# reusing `master_register_exporter`'s layout. No document-identifying
-# column is kept here on purpose: this register's duplicate rule is
-# defined purely on Accession Number (see `is_duplicate`), so once a row
-# is written it is never located/edited again by anything other than a
-# person opening the file -- an append-only ledger, not a synced mirror
-# of the DB.
+# Exact column order requested for this register (matches the reference
+# accession-register sample) -- distinct from (a differently-shaped set of
+# columns than) the DB-backed register's own sheet, which is why this
+# lives in its own module/file rather than reusing
+# `master_register_exporter`'s layout. No document-identifying column is
+# kept here on purpose: this register's duplicate rule is defined purely
+# on Accession Number (see `is_duplicate`), so once a row is written it is
+# never located/edited again by anything other than a person opening the
+# file -- an append-only ledger, not a synced mirror of the DB.
 HEADERS: list[str] = [
-    "Date",
-    "Accession Number",
+    "S.No",
     "Book Name",
-    "Page",
+    "Accession Number",
+    "Author Name",
+    "Publisher Name",
+    "Pages",
     "Language",
-    "Year of Publication",
-    "Creator",
-    "Searchable PDF Filename",
-    "PDF Path",
-    "Processing Timestamp",
 ]
 (
-    COL_DATE, COL_ACCESSION, COL_BOOK_NAME, COL_PAGE, COL_LANGUAGE, COL_YEAR,
-    COL_CREATOR, COL_PDF_FILENAME, COL_PDF_PATH, COL_TIMESTAMP,
+    COL_SNO, COL_BOOK_NAME, COL_ACCESSION, COL_AUTHOR, COL_PUBLISHER, COL_PAGE, COL_LANGUAGE,
 ) = range(1, len(HEADERS) + 1)
 
 # Starting width per column -- `autosize_columns` only ever widens from
 # here for a newly-written row's actual content, never rescans the whole
 # sheet (this workbook may hold 20,000+ rows; an O(n) rescan on every
 # single append would make appends progressively slower forever).
-_DEFAULT_COLUMN_WIDTHS = [13, 18, 45, 8, 16, 20, 32, 30, 45, 20]
+_DEFAULT_COLUMN_WIDTHS = [7, 45, 18, 32, 32, 8, 16]
 _MAX_COLUMN_WIDTH = 60
 
 _HEADER_FILL = PatternFill(start_color="3A8E2D", end_color="3A8E2D", fill_type="solid")
@@ -110,23 +105,18 @@ _ACCESSION_NUMBER_RE = re.compile(r"^(?P<prefix>.+)-(?P<n>\d+)$")
 
 @dataclass
 class RegisterRow:
-    record_date: date
-    accession_number: str
     book_name: str
+    accession_number: str
+    author: Optional[str]
+    publisher: Optional[str]
     page_count: int
     language: Optional[str]
-    year_of_publication: Optional[str]
-    creator: Optional[str]
-    pdf_filename: Optional[str]
-    pdf_path: Optional[str]
-    processing_timestamp: datetime
 
     def as_values(self) -> list:
-        return [
-            self.record_date, self.accession_number, self.book_name, self.page_count,
-            self.language, self.year_of_publication, self.creator, self.pdf_filename,
-            self.pdf_path, self.processing_timestamp,
-        ]
+        """S.No is always written as `None` here -- it's derived purely
+        from row position and gets filled in by `sort_register` (called
+        after every append/rebuild), never stored on the row itself."""
+        return [None, self.book_name, self.accession_number, self.author, self.publisher, self.page_count, self.language]
 
 
 # ---------------------------------------------------------------------------
@@ -294,36 +284,28 @@ def generate_next_accession() -> str:
 # ---------------------------------------------------------------------------
 
 def sort_register(sheet: Worksheet) -> None:
-    """Keeps the sheet ordered by Date ascending, then Accession Number
-    ascending within the same date -- re-run after every append/update so
-    the workbook is always in this order on disk, not just at export
-    time."""
-    if sheet.max_row <= 2:
+    """Keeps the sheet ordered by Accession Number ascending, with S.No
+    renumbered 1..N to match -- re-run after every append/rebuild so the
+    workbook is always in this order on disk, not just at export time."""
+    if sheet.max_row < 2:
         return
 
     rows = [[sheet.cell(row=r, column=c).value for c in range(1, len(HEADERS) + 1)] for r in range(2, sheet.max_row + 1)]
 
     def sort_key(values: list):
-        raw_date = values[COL_DATE - 1]
-        if isinstance(raw_date, datetime):
-            raw_date = raw_date.date()
-        accession = str(values[COL_ACCESSION - 1] or "").strip().lower()
-        return (raw_date or date.min, accession)
+        return str(values[COL_ACCESSION - 1] or "").strip().lower()
 
     rows.sort(key=sort_key)
 
-    for row_idx, values in enumerate(rows, start=2):
-        _write_row_values(sheet, row_idx, values)
+    for offset, values in enumerate(rows):
+        values[COL_SNO - 1] = offset + 1
+        _write_row_values(sheet, 2 + offset, values)
 
 
 def _write_row_values(sheet: Worksheet, row_idx: int, values: list) -> None:
     for col_idx, value in enumerate(values, start=1):
         cell = sheet.cell(row=row_idx, column=col_idx, value=value)
         cell.alignment = _DATA_ALIGNMENT
-        if col_idx == COL_DATE:
-            cell.number_format = "DD-MM-YYYY"
-        elif col_idx == COL_TIMESTAMP:
-            cell.number_format = "DD-MM-YYYY HH:MM:SS"
 
 
 # ---------------------------------------------------------------------------
@@ -381,30 +363,14 @@ def _latest_searchable_pdf(db: Session, document_id: str) -> tuple[Optional[str]
     return os.path.basename(export.storage_path), export.storage_path
 
 
-def _as_naive_utc(moment: Optional[datetime]) -> datetime:
-    """openpyxl can't store tz-aware datetimes -- normalize to naive UTC,
-    falling back to "now" when the job has no recorded finish time."""
-    if moment is None:
-        return datetime.now(timezone.utc).replace(tzinfo=None)
-    if moment.tzinfo is not None:
-        return moment.astimezone(timezone.utc).replace(tzinfo=None)
-    return moment
-
-
-def _build_row(
-    record: AccessionRecord, pdf_filename: Optional[str], pdf_path: Optional[str], processed_at: Optional[datetime]
-) -> RegisterRow:
+def _build_row(record: AccessionRecord) -> RegisterRow:
     return RegisterRow(
-        record_date=record.record_date,
-        accession_number=record.accession_number,
         book_name=record.book_name,
+        accession_number=record.accession_number,
+        author=record.author,
+        publisher=record.publisher,
         page_count=record.total_pages,
         language=record.language,
-        year_of_publication=record.year_of_publication,
-        creator=record.creator,
-        pdf_filename=pdf_filename,
-        pdf_path=pdf_path,
-        processing_timestamp=_as_naive_utc(processed_at),
     )
 
 
@@ -412,7 +378,9 @@ def _build_eligible_row(db: Session, document_id: str, log_skips: bool = True) -
     """Builds the register row for `document_id`, or None (logging why, if
     `log_skips`) unless every precondition holds: the document exists, its
     most recent `ProcessingJob` is COMPLETED (never FAILED/CANCELLED), it
-    has an `AccessionRecord`, and a `SEARCHABLE_PDF` export exists."""
+    has an `AccessionRecord`, and a `SEARCHABLE_PDF` export exists (proof
+    the document is genuinely fully processed, even though the export's
+    own filename/path aren't columns in this simpler register)."""
     document = db.get(Document, document_id)
     if document is None:
         if log_skips:
@@ -431,13 +399,13 @@ def _build_eligible_row(db: Session, document_id: str, log_skips: bool = True) -
             logger.warning("master_register_skipped_missing_accession_record", document_id=document_id)
         return None
 
-    pdf_filename, pdf_path = _latest_searchable_pdf(db, document_id)
+    pdf_filename, _ = _latest_searchable_pdf(db, document_id)
     if pdf_filename is None:
         if log_skips:
             logger.info("master_register_skipped_no_searchable_pdf", document_id=document_id)
         return None
 
-    return _build_row(record, pdf_filename, pdf_path, job.finished_at)
+    return _build_row(record)
 
 
 def _read_accession_set() -> set[str]:

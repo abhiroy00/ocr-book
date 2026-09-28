@@ -55,10 +55,15 @@ def test_title_shattered_across_word_blocks_is_read_whole():
     assert info.title == "Studies in the Economics of Farm Management Rajasthan COMBINED REPORT FOR THE YEAR 1962-53 TO 1964-55"
 
 
-def test_personal_authors_under_by_are_the_creator_without_degrees():
+def test_personal_authors_under_by_are_the_author_without_degrees():
     pages, words = _load("farm_management_pali_1973")
     # Previously "the".
-    assert analyze_cover(pages, words).creator == "Mrs. Kusum Rathore / Bhupal Singh Rathore / Dr. Ram K. Patel"
+    info = analyze_cover(pages, words)
+    assert info.author == "Mrs. Kusum Rathore / Bhupal Singh Rathore / Dr. Ram K. Patel"
+    # This same cover ALSO carries the issuing body further down -- author
+    # and publisher are independent, not either/or (see the reference
+    # register sample: real books commonly have both).
+    assert info.publisher == "DIRECTORATE OF ECONOMICS STATISTICS MINISTRY OF AGRICULTURE GOVERNMENT OF INDIA"
 
 
 def test_imprint_year_at_the_bottom_beats_the_period_printed_in_the_title():
@@ -74,19 +79,22 @@ def test_multiline_title_with_period_line_and_imprint_year():
     assert info.year == "1967"
 
 
-def test_issuing_body_is_the_creator_when_there_are_no_personal_authors():
+def test_issuing_body_is_the_publisher_when_there_are_no_personal_authors():
     pages, words = _load("area_production_yield_1967")
-    creator = analyze_cover(pages, words).creator
-    assert creator is not None
-    assert creator.startswith("DIRECTORATE")
-    assert "MINISTRY" in creator and creator.endswith("GOVERNMENT OF INDIA")
+    info = analyze_cover(pages, words)
+    assert info.author is None
+    publisher = info.publisher
+    assert publisher is not None
+    assert publisher.startswith("DIRECTORATE")
+    assert "MINISTRY" in publisher and publisher.endswith("GOVERNMENT OF INDIA")
 
 
 def test_cover_is_found_on_page_two_when_page_one_has_no_text():
     pages, words = _load("statistical_abstract_mizoram_1995")
     info = analyze_cover(pages, words)
     assert info.title == "STATISTICAL ABSTRACT"  # not the small stamp text or the department line
-    assert info.creator == "DEP ARTMEN'T OF AGRICULTURR MINOR IRRIGATION MIZORAM"  # OCR's own spelling, stray "&" glyph dropped
+    assert info.author is None
+    assert info.publisher == "DEP ARTMEN'T OF AGRICULTURR MINOR IRRIGATION MIZORAM"  # OCR's own spelling, stray "&" glyph dropped
     assert info.year == "1995-1996"
 
 
@@ -94,7 +102,11 @@ def test_extract_book_metadata_uses_the_cover_reader_end_to_end():
     pages, words = _load("farm_management_pali_1973")
     metadata = extract_book_metadata("Studies_in_the_Eco.pdf", pages, words)
     assert metadata.book_name.startswith("Studies in the Economics of Farm Management")
-    assert metadata.creator == "Mrs. Kusum Rathore / Bhupal Singh Rathore / Dr. Ram K. Patel"
+    assert metadata.author == "Mrs. Kusum Rathore / Bhupal Singh Rathore / Dr. Ram K. Patel"
+    assert metadata.publisher == "DIRECTORATE OF ECONOMICS STATISTICS MINISTRY OF AGRICULTURE GOVERNMENT OF INDIA"
+    # Backward-compatible combined value (prefers author) for the older,
+    # single-column DB/export consumers.
+    assert metadata.creator == metadata.author
     assert metadata.year_of_publication == "1973"
     assert metadata.needs_review is False
 
@@ -102,7 +114,7 @@ def test_extract_book_metadata_uses_the_cover_reader_end_to_end():
 def test_nothing_readable_leaves_fields_empty_for_the_fallbacks():
     page = PageJSON(document_id="d", page_id="p1", page_number=1, page_width=1000, page_height=1400, dpi=150, blocks=[])
     info = analyze_cover([page], {1: []})
-    assert (info.title, info.creator, info.year) == (None, None, None)
+    assert (info.title, info.author, info.publisher, info.year) == (None, None, None, None)
 
 
 @pytest.mark.parametrize("text,expected", [

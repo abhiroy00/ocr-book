@@ -59,7 +59,13 @@ class CoverInfo:
     """What could be read off the cover; any field may be None."""
 
     title: str | None = None
-    creator: str | None = None
+    # Kept distinct rather than folded into one "creator" string: a
+    # personal-author line ("BY Mrs. Kusum Rathore...") and an issuing-
+    # body line ("DIRECTORATE OF ECONOMICS... GOVERNMENT OF INDIA") answer
+    # different register columns (Author Name vs Publisher Name) and this
+    # project's real corpus has documents with either, both, or neither.
+    author: str | None = None
+    publisher: str | None = None
     year: str | None = None
 
 
@@ -306,8 +312,13 @@ def _author_name(text: str) -> str | None:
     return name if _letters(name) >= 3 else None
 
 
-def _find_creator(lines: list[_Line], title_end: int) -> str | None:
-    # 1. Personal authors: the lines under a lone "BY".
+def _find_author_and_publisher(lines: list[_Line], title_end: int) -> tuple[str | None, str | None]:
+    """Independent, not either/or: a real cover often carries both --
+    personal author names AND the issuing/publishing body (see the
+    reference register sample: "TIRATH GUPTA DEEPINDER MOHAN" as author,
+    "OXFORD & IBH PUBLISHIING CO. DELHI" as publisher, on the same book)."""
+    author = None
+    # Personal authors: the lines under a lone "BY".
     for i, ln in enumerate(lines):
         if not re.fullmatch(r"(?i)by[:.]?", ln.text.strip()):
             continue
@@ -327,11 +338,13 @@ def _find_creator(lines: list[_Line], title_end: int) -> str | None:
                 names.append(name)
             prev = nxt
         if names:
-            return " / ".join(names[:_MAX_AUTHORS])
+            author = " / ".join(names[:_MAX_AUTHORS])
+            break
 
-    # 2. Issuing body: the first run of org-like lines below the title (or
-    # the first anywhere if no title was found), plus its obvious
-    # continuation lines.
+    publisher = None
+    # Issuing/publishing body: the first run of org-like lines below the
+    # title (or the first anywhere if no title was found), plus its
+    # obvious continuation lines.
     i = title_end + 1
     while i < len(lines):
         if _is_org(lines[i]) and _substantial(lines[i]):
@@ -349,9 +362,11 @@ def _find_creator(lines: list[_Line], title_end: int) -> str | None:
                 group.append(nxt)
                 j += 1
             text = re.sub(r"(?i)^\s*published\s+by\s+", "", " ".join(ln.text for ln in group))
-            return _tidy(text) or None
+            publisher = _tidy(text) or None
+            break
         i += 1
-    return None
+
+    return author, publisher
 
 
 def _find_year(lines: list[_Line], title_end: int, page_height: float) -> str | None:
@@ -394,8 +409,10 @@ def analyze_cover(title_pages: list[PageJSON], words_by_page: dict[int, list[OCR
 
     _, lines, page_height = best
     title, title_end = _find_title(lines, page_height)
+    author, publisher = _find_author_and_publisher(lines, title_end)
     return CoverInfo(
         title=title,
-        creator=_find_creator(lines, title_end),
+        author=author,
+        publisher=publisher,
         year=_find_year(lines, title_end, page_height),
     )

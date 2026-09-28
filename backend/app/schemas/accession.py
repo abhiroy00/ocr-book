@@ -14,6 +14,8 @@ class AccessionRecordRead(BaseModel):
     accession_number: str
     book_name: str
     creator: Optional[str] = None
+    author: Optional[str] = None
+    publisher: Optional[str] = None
     language: Optional[str] = None
     year_of_publication: Optional[str] = None
     total_pages: int
