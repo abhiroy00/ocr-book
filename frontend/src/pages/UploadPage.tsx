@@ -1,7 +1,9 @@
 import { useCallback, useState } from "react";
+import { useQuery } from "@tanstack/react-query";
 import { useNavigate } from "react-router-dom";
 import clsx from "clsx";
 import { documentsApi } from "@/services/api";
+import { batchApi } from "@/services/batchApi";
 import { BatchDropzone, BatchSubmit } from "@/components/BatchUploadPanel";
 import { useBatchUpload } from "@/hooks/useBatchUpload";
 import type { OCRProvider, PreprocessProfile } from "@/types/document";
@@ -51,19 +53,27 @@ export default function UploadPage() {
   // mode so nothing about that flow -- or a file already picked in it --
   // changes when you switch tabs.
   const [mode, setMode] = useState<"single" | "multiple">("single");
-  const batch = useBatchUpload({ accepted: ACCEPTED_EXTENSIONS, ocrProvider, dpi, profile });
+  const { data: capacity } = useQuery({ queryKey: ["batchCapacity"], queryFn: () => batchApi.capacity() });
+  const batch = useBatchUpload({ accepted: ACCEPTED_EXTENSIONS, ocrProvider, dpi, profile, maxFileMb: capacity?.max_file_mb });
 
-  const handleFiles = useCallback((files: FileList | null) => {
-    if (!files || files.length === 0) return;
-    const picked = files[0];
-    const ext = "." + picked.name.split(".").pop()?.toLowerCase();
-    if (!ACCEPTED_EXTENSIONS.includes(ext)) {
-      setError(`Unsupported file type ${ext}. Allowed: ${ACCEPTED_EXTENSIONS.join(", ")}`);
-      return;
-    }
-    setError(null);
-    setFile(picked);
-  }, []);
+  const handleFiles = useCallback(
+    (files: FileList | null) => {
+      if (!files || files.length === 0) return;
+      const picked = files[0];
+      const ext = "." + picked.name.split(".").pop()?.toLowerCase();
+      if (!ACCEPTED_EXTENSIONS.includes(ext)) {
+        setError(`Unsupported file type ${ext}. Allowed: ${ACCEPTED_EXTENSIONS.join(", ")}`);
+        return;
+      }
+      if (capacity?.max_file_mb && picked.size > capacity.max_file_mb * 1024 * 1024) {
+        setError(`${picked.name} is ${formatBytes(picked.size)}, over the ${capacity.max_file_mb}MB upload limit.`);
+        return;
+      }
+      setError(null);
+      setFile(picked);
+    },
+    [capacity?.max_file_mb],
+  );
 
   const onDrop = (e: React.DragEvent) => {
     e.preventDefault();
@@ -84,7 +94,18 @@ export default function UploadPage() {
       });
       navigate(`/documents/${result.document_id}`);
     } catch (err: any) {
-      setError(err?.response?.data?.detail || "Upload failed. Please try again.");
+      const detail = err?.response?.data?.detail;
+      const status = err?.response?.status;
+      // A 413 (over nginx's own client_max_body_size) never reaches the
+      // backend, so there's no JSON `detail` to read -- name the size
+      // limit explicitly rather than a bare "Upload failed" with no clue why.
+      setError(
+        typeof detail === "string"
+          ? detail
+          : status === 413
+            ? `File is too large for the server's upload limit${capacity ? ` (${capacity.max_file_mb}MB)` : ""}.`
+            : "Upload failed. Please try again.",
+      );
       setUploadPercent(null);
     }
   };

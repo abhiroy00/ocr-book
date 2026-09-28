@@ -60,7 +60,14 @@ class Settings(BaseSettings):
     s3_region: str = "us-east-1"
 
     # --- Upload ---
-    max_upload_size_mb: int = 200
+    # Raised from 200 -- real scanned legal/statute compilations in this
+    # project's corpus (e.g. "The India Code" volumes) run to 700MB+ as a
+    # single PDF; 200 (and the 500 most deployments override this to via
+    # .env) rejected those outright. Must stay <= nginx's own
+    # `client_max_body_size` (docker/frontend/nginx.prod.conf,
+    # docker/nginx/nginx.conf) or nginx rejects the upload before this
+    # setting is ever consulted.
+    max_upload_size_mb: int = 1024
     allowed_upload_extensions: str = ".pdf,.jpg,.jpeg,.png,.webp"
 
     # --- Rendering / preprocessing ---
