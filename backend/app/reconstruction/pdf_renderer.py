@@ -214,6 +214,18 @@ def _render_text(page, rect: "fitz.Rect", block: DocumentBlockJSON,
         page.insert_textbox(rect, text, **kwargs)
 
 
+def _default_font_size(block_type: LayoutBlockType) -> float:
+    return {
+        LayoutBlockType.TITLE: 18.0,
+        LayoutBlockType.HEADING: 14.0,
+        LayoutBlockType.SUBHEADING: 12.0,
+        LayoutBlockType.PAGE_NUMBER: 9.0,
+        LayoutBlockType.FOOTNOTE: 8.0,
+        LayoutBlockType.HEADER: 9.0,
+        LayoutBlockType.FOOTER: 9.0,
+    }.get(block_type, 10.0)
+
+
 def _render_table(page, block: DocumentBlockJSON, page_json: PageJSON, body_font) -> None:
     """Draws each cell's border, then its text sized to actually fit.
 

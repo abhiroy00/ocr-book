@@ -6,7 +6,7 @@ import fitz
 
 from app.models.enums import LayoutBlockType, TextAlign
 from app.reconstruction.pdf_renderer import render_document_pdf
-from app.schemas.document_json import DocumentBlockJSON, PageJSON, TableBlockJSON, TableCellJSON, TableRowJSON
+from app.schemas.document_json import DocumentBlockJSON, PageJSON, TableBlockJSON, TableCellJSON, TableRowJSON, TextRunJSON
 from app.schemas.geometry import BBox, NormBBox
 
 
@@ -75,3 +75,26 @@ def test_render_table_skips_genuinely_empty_cells_without_error():
     text = doc[0].get_text()
     doc.close()
     assert "value" in text
+
+
+def test_render_text_block_without_stored_font_size_uses_type_default():
+    """Regression test: `_default_font_size` was deleted while
+    `_render_text` still fell back to it, so any text block with no
+    `font_size` in its style hit a NameError -- caught per block, so the
+    text was silently missing from the reconstructed PDF."""
+    block = DocumentBlockJSON(
+        id="t0",
+        type=LayoutBlockType.PARAGRAPH,
+        bbox=BBox(x1=40, y1=40, x2=700, y2=200),
+        bbox_norm=NormBBox(x1=0.05, y1=0.03, x2=0.87, y2=0.17),
+        confidence=0.9,
+        content=[TextRunJSON(text="Trends and cycles in economic activity")],
+    )
+    page_json = PageJSON(document_id="d0", page_id="p0", page_number=1, page_width=800, page_height=1200, dpi=150, blocks=[block])
+
+    pdf_bytes = render_document_pdf([page_json])
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    text = doc[0].get_text()
+    doc.close()
+
+    assert "economic activity" in text

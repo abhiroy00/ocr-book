@@ -8,7 +8,7 @@ import { documentsApi } from "@/services/api";
 vi.mock("@/services/api", () => ({
   documentsApi: { get: vi.fn(), progress: vi.fn(), reprocess: vi.fn(), cancel: vi.fn() },
   fileUrl: (p: string) => p,
-  wsUrlForDocument: (id: string) => `ws://test/ws/documents/${id}`,
+  wsUrlForDocument: (id: string) => `ws://localhost/ws/documents/${id}`,
 }));
 
 function doc(status: string) {
@@ -51,8 +51,21 @@ function renderPage() {
   );
 }
 
+// Never let jsdom open a real socket: its connection attempt (and cookie
+// lookup for the fake host) raises an unhandled error on some jsdom
+// versions, which fails the run even when every test passes.
+class SilentWebSocket {
+  onmessage = null;
+  onerror = null;
+  onclose = null;
+  constructor(public url: string) {}
+  send() {}
+  close() {}
+}
+
 describe("DocumentDetailPage retry", () => {
   beforeEach(() => {
+    vi.stubGlobal("WebSocket", SilentWebSocket);
     vi.mocked(documentsApi.get).mockReset();
     vi.mocked(documentsApi.progress).mockReset();
     vi.mocked(documentsApi.reprocess).mockReset();
