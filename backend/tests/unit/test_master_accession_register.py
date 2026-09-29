@@ -357,3 +357,65 @@ def test_refresh_leaves_documents_without_stored_pages_alone(test_db_session, tm
     assert result["documents_refreshed"] == 0
     record = test_db_session.query(AccessionRecord).filter_by(document_id=document.id).one()
     assert record.book_name == "Kept As Is"
+
+
+# ---------------------------------------------------------------------------
+# Schema-mismatch auto-recovery (a stale header from an older column layout
+# must never be silently reused with new-layout row data underneath it)
+# ---------------------------------------------------------------------------
+
+def test_a_stale_header_from_an_older_schema_triggers_a_rebuild(tmp_storage):
+    from openpyxl import Workbook as _WB
+
+    path = reg.ensure_master_excel()
+    stale = _WB()
+    sheet = stale.active
+    sheet.title = reg.SHEET_NAME
+    # An old, no-longer-current header shape (fewer/differently-ordered columns).
+    for col_idx, label in enumerate(["Date", "Accession Number", "Book Name"], start=1):
+        sheet.cell(row=1, column=col_idx, value=label)
+    sheet.cell(row=2, column=1, value="stale garbage row")
+    stale.save(path)
+
+    fixed_path = reg.ensure_master_excel()
+
+    sheet = _register_sheet(fixed_path)
+    assert [sheet.cell(row=1, column=c).value for c in range(1, len(reg.HEADERS) + 1)] == reg.HEADERS
+    assert sheet.max_row == 1  # the stale row is gone, not misaligned under the new header
+
+
+def test_an_up_to_date_header_is_left_alone(tmp_storage):
+    path = reg.ensure_master_excel()
+    wb = load_workbook(path)
+    wb[reg.SHEET_NAME].cell(row=2, column=reg.COL_BOOK_NAME, value="Untouched")
+    wb.save(path)
+
+    second_path = reg.ensure_master_excel()
+
+    assert second_path == path
+    assert _register_sheet(second_path).cell(row=2, column=reg.COL_BOOK_NAME).value == "Untouched"
+
+
+def test_sync_repopulates_after_a_schema_rebuild(test_db_session, tmp_storage, sample_png_bytes):
+    """The realistic end-to-end recovery path: an old-schema file gets
+    rebuilt blank by `ensure_master_excel`, and the very next DB-aware
+    call (here, the download route's own sync) repopulates it correctly
+    -- no document is permanently lost, only the stale/misaligned copy."""
+    from openpyxl import Workbook as _WB
+
+    document, _ = _make_completed_document(test_db_session, tmp_storage, sample_png_bytes, "D-1", "Book One")
+
+    path = reg.ensure_master_excel()
+    stale = _WB()
+    sheet = stale.active
+    sheet.title = reg.SHEET_NAME
+    sheet.cell(row=1, column=1, value="Some Old Column")
+    stale.save(path)
+
+    data = reg.get_master_register_bytes(test_db_session)
+
+    from io import BytesIO
+
+    sheet = load_workbook(BytesIO(data))[reg.SHEET_NAME]
+    assert [sheet.cell(row=1, column=c).value for c in range(1, len(reg.HEADERS) + 1)] == reg.HEADERS
+    assert sheet.cell(row=2, column=reg.COL_ACCESSION).value == "D-1"

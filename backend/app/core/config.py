@@ -182,10 +182,20 @@ class Settings(BaseSettings):
     # PDF bytes + a few page buffers). Paddle uses OCR_WORKER_EST_MEMORY_MB
     # instead. Estimate; verify on your own host before relying on it.
     batch_light_engine_est_memory_mb: int = 700
-    batch_max_files: int = 20
+    # Raised from 20 -- a real use case in this project's corpus is
+    # uploading 60-70 books in one batch; they still process one-by-one
+    # (bounded by resolved_ocr_workers/concurrency slots below, never all
+    # at once), so a low file-count cap here was blocking a legitimate
+    # workload for no corresponding safety benefit.
+    batch_max_files: int = 500
     # Sum of all files' sizes in one batch -- bounds uncontrolled disk use
     # (each uploaded original is persisted before processing starts).
-    batch_max_total_mb: int = 2048
+    # Raised from 2048 (2GB): individual scanned legal/statute volumes in
+    # this corpus already run to 700MB+ (see MAX_UPLOAD_SIZE_MB), so a
+    # 2GB batch cap was rejecting well under 10 such files. Real disk
+    # exhaustion is still guarded separately and per-file, not by this
+    # aggregate number, via BATCH_DISK_RESERVE_MB below.
+    batch_max_total_mb: int = 102400
     # Free-disk headroom required before accepting another file, on local
     # storage: a fixed reserve plus an estimate of the page images one page
     # of output costs (original + processed PNG per page at 150-300 DPI).

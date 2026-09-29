@@ -125,21 +125,39 @@ class RegisterRow:
 
 def ensure_master_excel() -> str:
     """Creates the workbook (header only, formatted) the first time it's
-    needed; never touches it if it already exists. Returns the local
-    filesystem path (directories created as needed). Safe to call from
-    every worker on every job -- idempotent, and the actual creation is
-    itself performed under the same file lock everything else uses, so
-    two workers racing to create it for the very first time can't both
-    "win" and stomp each other's `Workbook()`."""
+    needed, and RECREATES it (header only -- see below) if an existing
+    file's header no longer matches the current `HEADERS`. Returns the
+    local filesystem path (directories created as needed). Safe to call
+    from every worker on every job -- idempotent, and the actual creation
+    is itself performed under the same file lock everything else uses, so
+    two workers racing for the very first time (or racing a schema
+    change) can't both "win" and stomp each other's `Workbook()`.
+
+    Why the schema check: this register's own column set has changed more
+    than once as requirements were refined. Without this check, a file
+    created under an OLDER `HEADERS` keeps its stale header/column widths
+    forever -- `os.path.exists(path)` alone can't tell "wrong shape" from
+    "up to date" -- while every subsequent write still uses the CURRENT
+    `RegisterRow.as_values()` layout. Confirmed as a real, produced defect:
+    a live file's header still read the old ("Date", "Accession Number",
+    "Book Name", ...) column order while rows underneath had already been
+    written in the new (S.No, Book Name, Accession Number, ...) order, so
+    every column was silently misaligned with its own header label. This
+    function no longer allows that combination to exist: a mismatch is
+    treated as "not really there yet" and the file is rebuilt blank (the
+    DB is the source of truth throughout this module, so nothing already-
+    correct is lost -- callers that have a DB session re-populate it
+    right after via `sync_register_from_db`/`rebuild_register_from_db`,
+    already invoked by every DB-aware entry point in this module)."""
     storage = get_storage()
     path = storage.local_path(REGISTER_RELATIVE_PATH)
-    if os.path.exists(path):
+    if os.path.exists(path) and _header_matches_current_schema(path):
         return path
 
     lock = acquire_lock()
     try:
-        if os.path.exists(path):  # re-check: another worker may have created it while we waited for the lock
-            return path
+        if os.path.exists(path) and _header_matches_current_schema(path):
+            return path  # another worker already created/rebuilt it while we waited for the lock
         wb = Workbook()
         sheet = wb.active
         sheet.title = SHEET_NAME
@@ -152,6 +170,20 @@ def ensure_master_excel() -> str:
     finally:
         release_lock(lock)
     return path
+
+
+def _header_matches_current_schema(path: str) -> bool:
+    try:
+        wb = _openpyxl_load_workbook(path, read_only=True)
+    except Exception:  # noqa: BLE001 - an unreadable/corrupt file is treated the same as "wrong schema": rebuild it
+        return False
+    try:
+        if SHEET_NAME not in wb.sheetnames:
+            return False
+        sheet = wb[SHEET_NAME]
+        return [sheet.cell(row=1, column=c).value for c in range(1, len(HEADERS) + 1)] == HEADERS
+    finally:
+        wb.close()
 
 
 def load_workbook() -> Workbook:
