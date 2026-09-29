@@ -339,7 +339,7 @@ def test_refresh_rereads_better_metadata_and_rebuilds_the_register(test_db_sessi
 
     result = reg.refresh_register_details(test_db_session)
 
-    assert result == {"documents_refreshed": 1, "documents_failed": 0, "register_rows": 1}
+    assert result == {"documents_refreshed": 1, "documents_failed": 0, "accession_numbers_updated": 0, "register_rows": 1}
     sheet = _register_sheet(reg.ensure_master_excel())
     assert sheet.max_row == 2  # rebuilt, not duplicated
     assert sheet.cell(row=2, column=reg.COL_ACCESSION).value == "D-3"  # accession numbers never change

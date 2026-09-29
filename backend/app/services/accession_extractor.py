@@ -129,19 +129,28 @@ def extract_book_metadata(
     )
 
 
-def _extract_accession_number(original_filename: str, title_pages: list[PageJSON], words_by_page: dict[int, list[OCRWordResult]] | None) -> str | None:
-    prefix = get_settings().accession_number_prefix
-
+def extract_accession_number_from_filename(original_filename: str) -> str | None:
+    """Public, filename-only entry point -- used by
+    `accession_service.backfill_extracted_accession_numbers` to correct a
+    record that only ever got an auto-generated placeholder (because it
+    was processed before this project could read a real number at all),
+    without needing to reload the document's full OCR/page data just for
+    this one field."""
     match = _ACCESSION_TOKEN_RE.search(original_filename)
-    if match:
-        normalized = _normalize_accession_match(match.group(1), prefix)
-        if normalized:
-            return normalized
+    if not match:
+        return None
+    return _normalize_accession_match(match.group(1), get_settings().accession_number_prefix)
+
+
+def _extract_accession_number(original_filename: str, title_pages: list[PageJSON], words_by_page: dict[int, list[OCRWordResult]] | None) -> str | None:
+    from_filename = extract_accession_number_from_filename(original_filename)
+    if from_filename:
+        return from_filename
 
     combined = " ".join(page_lines_text(title_pages, words_by_page))
     match = _ACCESSION_TOKEN_RE.search(combined)
     if match:
-        return _normalize_accession_match(match.group(1), prefix)
+        return _normalize_accession_match(match.group(1), get_settings().accession_number_prefix)
 
     return None
 

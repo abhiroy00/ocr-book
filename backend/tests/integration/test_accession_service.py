@@ -172,3 +172,51 @@ def test_reprocessing_never_changes_an_already_assigned_accession_number(test_db
     second = accession_service.create_accession_record_for_document(test_db_session, doc, [_title_page("Corrected Title")])
     assert second.id == first.id
     assert second.accession_number == "D-1087"
+
+
+def test_backfill_updates_a_placeholder_number_to_the_real_one_from_the_filename(test_db_session, tmp_storage, sample_png_bytes):
+    doc = _make_document(test_db_session, tmp_storage, sample_png_bytes, filename="a_plain_name.png")
+    record = accession_service.create_accession_record_for_document(test_db_session, doc, [_title_page("Book")])
+    assert record.accession_number == "D-1"  # no ACC_NO in the filename yet -- auto-generated
+
+    doc.original_filename = "BOOK_ACC_NO.1087.png"
+    test_db_session.commit()
+
+    result = accession_service.backfill_extracted_accession_numbers(test_db_session)
+
+    assert result == {"updated": 1, "skipped_taken": 0, "unchanged": 0}
+    test_db_session.refresh(record)
+    assert record.accession_number == "D-1087"
+
+
+def test_backfill_never_overwrites_a_number_already_taken_by_another_record(test_db_session, tmp_storage, sample_png_bytes):
+    taken = _make_document(test_db_session, tmp_storage, sample_png_bytes, filename="OTHER_ACC_NO.1087.png")
+    accession_service.create_accession_record_for_document(test_db_session, taken, [_title_page("Other Book")])
+
+    doc = _make_document(test_db_session, tmp_storage, sample_png_bytes, filename="a_plain_name.png")
+    record = accession_service.create_accession_record_for_document(test_db_session, doc, [_title_page("Book")])
+    doc.original_filename = "BOOK_ACC_NO.1087.png"  # collides with `taken`'s real number
+    test_db_session.commit()
+
+    result = accession_service.backfill_extracted_accession_numbers(test_db_session)
+
+    # `taken`'s own record is already correct (unchanged); `record` is the
+    # one that would collide (skipped).
+    assert result == {"updated": 0, "skipped_taken": 1, "unchanged": 1}
+    test_db_session.refresh(record)
+    assert record.accession_number == "D-1088"  # left alone, not collided with `taken`'s "D-1087"
+
+
+def test_backfill_leaves_a_correct_or_unmatchable_number_alone(test_db_session, tmp_storage, sample_png_bytes):
+    already_correct = _make_document(test_db_session, tmp_storage, sample_png_bytes, filename="X_ACC_NO.55.png")
+    correct_record = accession_service.create_accession_record_for_document(test_db_session, already_correct, [_title_page("A")])
+    assert correct_record.accession_number == "D-55"
+
+    no_match = _make_document(test_db_session, tmp_storage, sample_png_bytes, filename="no_acc_no.png")
+    no_match_record = accession_service.create_accession_record_for_document(test_db_session, no_match, [_title_page("B")])
+
+    result = accession_service.backfill_extracted_accession_numbers(test_db_session)
+
+    assert result == {"updated": 0, "skipped_taken": 0, "unchanged": 2}
+    assert correct_record.accession_number == "D-55"
+    assert no_match_record.accession_number == "D-56"  # auto-generation continues past the highest existing number

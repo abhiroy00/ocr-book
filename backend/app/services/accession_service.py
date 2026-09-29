@@ -20,7 +20,7 @@ from app.models.accession_record import AccessionRecord
 from app.models.document import Document
 from app.schemas.document_json import PageJSON
 from app.schemas.ocr import OCRWordResult
-from app.services.accession_extractor import extract_book_metadata
+from app.services.accession_extractor import extract_accession_number_from_filename, extract_book_metadata
 
 logger = get_logger(__name__)
 
@@ -129,6 +129,54 @@ def create_accession_record_for_document(
         needs_review=record.needs_review,
     )
     return record
+
+
+def backfill_extracted_accession_numbers(db: Session) -> dict:
+    """Explicit, opt-in correction for records still holding an
+    auto-generated placeholder from before this project could read a real
+    accession number at all (filename-only -- see
+    `accession_extractor.extract_accession_number_from_filename`; the
+    cover-OCR fallback needs full page data and isn't worth reloading for
+    every record here, so a book without an ACC_NO-bearing filename just
+    keeps its current number).
+
+    Deliberately NOT part of `create_accession_record_for_document`'s
+    normal reprocess path, which never touches an existing record's
+    number on purpose (renumbering an already-catalogued book on routine
+    reprocess would be wrong) -- this is a one-off, explicitly invoked
+    migration for records that were never given the chance to have a real
+    number in the first place. Never overwrites a number that's already
+    correct, and never collides with a DIFFERENT record's number."""
+    updated = skipped_taken = unchanged = 0
+    for record in db.scalars(select(AccessionRecord)).all():
+        document = db.get(Document, record.document_id)
+        if document is None:
+            continue
+        extracted = extract_accession_number_from_filename(document.original_filename)
+        if extracted is None or extracted == record.accession_number:
+            unchanged += 1
+            continue
+        taken_by = db.scalar(
+            select(AccessionRecord).where(
+                AccessionRecord.accession_number == extracted, AccessionRecord.id != record.id
+            )
+        )
+        if taken_by is not None:
+            logger.warning(
+                "accession_number_backfill_collision", document_id=document.id,
+                current=record.accession_number, extracted=extracted, taken_by_document_id=taken_by.document_id,
+            )
+            skipped_taken += 1
+            continue
+        logger.info(
+            "accession_number_backfilled", document_id=document.id,
+            old=record.accession_number, new=extracted,
+        )
+        record.accession_number = extracted
+        updated += 1
+
+    db.commit()
+    return {"updated": updated, "skipped_taken": skipped_taken, "unchanged": unchanged}
 
 
 def list_accession_records(

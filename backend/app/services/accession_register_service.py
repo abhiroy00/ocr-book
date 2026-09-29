@@ -605,12 +605,21 @@ def rebuild_register_from_db(db: Session) -> int:
 
 
 def refresh_register_details(db: Session) -> dict[str, int]:
-    """Re-reads title / creator / year / language for every completed
-    document from its stored OCR data (no re-OCR -- see
-    `accession_service.refresh_metadata_from_stored_ocr`), then rebuilds
-    the register so it shows the corrected values. Accession numbers are
-    never changed. A document that can't be refreshed keeps its existing
-    values and is counted under `failed`."""
+    """Re-reads title / author / publisher / year / language for every
+    completed document from its stored OCR data (no re-OCR -- see
+    `accession_service.refresh_metadata_from_stored_ocr`), backfills a
+    real accession number (filename-only -- see
+    `accession_service.backfill_extracted_accession_numbers`) for any
+    record still holding an auto-generated placeholder from before this
+    project could read one at all, then rebuilds the register so it shows
+    the corrected values. A document that can't be refreshed keeps its
+    existing values and is counted under `failed`.
+
+    The backfill is the ONE place an accession number can change after
+    the fact -- normal reprocessing (`create_accession_record_for_document`)
+    never touches an existing record's number, and the backfill itself
+    never overwrites one that's already correct or would collide with a
+    different record's."""
     from app.services import accession_service
 
     documents = db.scalars(
@@ -627,7 +636,14 @@ def refresh_register_details(db: Session) -> dict[str, int]:
             failed += 1
             logger.error("master_register_refresh_failed", document_id=document.id, error=str(exc))
 
-    return {"documents_refreshed": refreshed, "documents_failed": failed, "register_rows": rebuild_register_from_db(db)}
+    accession_backfill = accession_service.backfill_extracted_accession_numbers(db)
+
+    return {
+        "documents_refreshed": refreshed,
+        "documents_failed": failed,
+        "accession_numbers_updated": accession_backfill["updated"],
+        "register_rows": rebuild_register_from_db(db),
+    }
 
 
 def get_master_register_bytes(db: Session) -> bytes:
