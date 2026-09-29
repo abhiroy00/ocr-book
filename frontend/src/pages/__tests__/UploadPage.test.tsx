@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import { render, screen, fireEvent, waitFor } from "@testing-library/react";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { MemoryRouter } from "react-router-dom";
 import UploadPage from "@/pages/UploadPage";
 import { documentsApi } from "@/services/api";
@@ -9,6 +10,12 @@ vi.mock("@/services/api", () => ({
   fileUrl: (p: string) => p,
 }));
 
+// UploadPage also fetches /batches/capacity (for the per-file size limit
+// shown/enforced client-side) via a real react-query hook, so it needs a
+// QueryClient in the tree -- unmocked here on purpose: these tests only
+// care about the single-file flow, and an unresolved capacity fetch just
+// leaves the optional size check off, same as before this fetch existed.
+
 const mockedNavigate = vi.fn();
 vi.mock("react-router-dom", async () => {
   const actual = await vi.importActual<typeof import("react-router-dom")>("react-router-dom");
@@ -16,10 +23,13 @@ vi.mock("react-router-dom", async () => {
 });
 
 function renderPage() {
+  const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   return render(
-    <MemoryRouter>
-      <UploadPage />
-    </MemoryRouter>,
+    <QueryClientProvider client={client}>
+      <MemoryRouter>
+        <UploadPage />
+      </MemoryRouter>
+    </QueryClientProvider>,
   );
 }
 

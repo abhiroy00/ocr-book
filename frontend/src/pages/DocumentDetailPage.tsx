@@ -1,4 +1,5 @@
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
+import axios from "axios";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Link, useParams } from "react-router-dom";
 import { documentsApi, fileUrl } from "@/services/api";
@@ -49,15 +50,23 @@ export default function DocumentDetailPage() {
   // Document (see backend/app/models/processing_job.py) -- reusing that
   // existing state rather than inventing separate timer bookkeeping.
   // Fetched once for a completed document (so re-opening it still shows
-  // its final duration -- test scenario H) and polled at the same 3s
-  // cadence as `document`/`pages` while active, which is what actually
-  // delivers `started_at` shortly after the backend sets it and
-  // `finished_at`/`processing_duration_seconds` the moment the job ends.
+  // its final duration -- test scenario H), and refetched on every status
+  // transition (effect below), which is what delivers `started_at` as
+  // PROCESSING begins and `finished_at`/`processing_duration_seconds` the
+  // moment the job ends. Live progress itself comes from
+  // `useDocumentProgress` (WebSocket), so while active this only polls
+  // slowly -- that read is also what runs the backend's stalled-job check
+  // (`detect_and_fail_stale_job`, 15+ min grace), so it can't stop
+  // entirely. It stops for good after an error instead of retrying a 404
+  // on a timer.
   const { data: job, refetch: refetchJob } = useQuery({
     queryKey: ["processingJob", id],
     queryFn: () => documentsApi.progress(id!),
     enabled: !!id,
-    refetchInterval: (q) => (q.state.data && ACTIVE_STATUSES.has(q.state.data.status) ? 3000 : false),
+    retry: (failureCount, error) =>
+      !(axios.isAxiosError(error) && error.response && error.response.status < 500) && failureCount < 3,
+    refetchInterval: (q) =>
+      q.state.status !== "error" && q.state.data && ACTIVE_STATUSES.has(q.state.data.status) ? 60000 : false,
   });
 
   // Reset the button's own "Stopping…" flag once the document actually
@@ -78,16 +87,34 @@ export default function DocumentDetailPage() {
     },
   });
 
-  if (progressEvent && progressEvent.status !== document?.status) {
+  const retryMutation = useMutation({
+    mutationFn: () => documentsApi.reprocess(id!),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["document", id] });
+      queryClient.invalidateQueries({ queryKey: ["processingJob", id] });
+    },
+  });
+
+  // In an effect, not the render body: calling refetch() during render
+  // re-ran on every re-render (each fetch settling re-renders) for as long
+  // as the event and document statuses disagreed -- a continuous request
+  // loop against both endpoints.
+  const eventStatus = progressEvent?.status;
+  const documentStatus = document?.status;
+  useEffect(() => {
     // Refresh the document record once a stage transition lands so the
     // status badge / action buttons stay in sync with the live event.
-    refetch();
-    // Same idea for the job record -- this is what gets `started_at` in
-    // front of the timer promptly (right as PROCESSING begins) and
-    // `finished_at`/`processing_duration_seconds` the instant the job
-    // ends, rather than waiting for the next 3s poll tick.
-    refetchJob();
-  }
+    if (eventStatus && eventStatus !== documentStatus) refetch();
+  }, [eventStatus, documentStatus, refetch]);
+
+  // Same idea for the job record -- this is what gets `started_at` in
+  // front of the timer promptly (right as PROCESSING begins) and
+  // `finished_at`/`processing_duration_seconds` the instant the job ends.
+  const lastJobRefreshStatus = useRef(documentStatus);
+  useEffect(() => {
+    if (documentStatus && lastJobRefreshStatus.current && documentStatus !== lastJobRefreshStatus.current) refetchJob();
+    lastJobRefreshStatus.current = documentStatus;
+  }, [documentStatus, refetchJob]);
 
   if (!document) {
     return <div className="text-slate-400 text-sm">Loading…</div>;
@@ -125,6 +152,22 @@ export default function DocumentDetailPage() {
             <Link to={`/documents/${id}/export`} className="px-4 py-2 rounded-lg bg-brand-600 text-white text-sm font-medium hover:bg-brand-700">
               Export
             </Link>
+          </div>
+        )}
+        {(document.status === "FAILED" || document.status === "CANCELLED") && (
+          <div className="flex flex-col items-end gap-1">
+            {/* Re-runs the pipeline with the document's own settings via the
+                existing `POST /documents/{id}/process` (fresh ProcessingJob,
+                previous error cleared server-side). */}
+            <button
+              type="button"
+              onClick={() => retryMutation.mutate()}
+              disabled={retryMutation.isPending}
+              className="px-4 py-2 rounded-lg bg-brand-600 text-white text-sm font-medium hover:bg-brand-700 disabled:opacity-50 disabled:cursor-not-allowed"
+            >
+              {retryMutation.isPending ? "Retrying…" : "Retry"}
+            </button>
+            {retryMutation.isError && <p className="text-xs text-red-600">Could not restart processing. Try again.</p>}
           </div>
         )}
       </div>

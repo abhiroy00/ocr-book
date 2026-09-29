@@ -138,3 +138,117 @@ def test_accession_summary_counts(test_db_session, tmp_storage, sample_png_bytes
     assert summary["needs_review_count"] == 1
     assert summary["total_documents_processed"] == 2
     assert summary["latest_record_date"] == date.today()
+
+
+def test_accession_number_from_filename_is_used_instead_of_auto_generated(test_db_session, tmp_storage, sample_png_bytes):
+    doc = _make_document(test_db_session, tmp_storage, sample_png_bytes, filename="ECONOMIC_SURVEY_ACC_NO.1087.png")
+    record = accession_service.create_accession_record_for_document(test_db_session, doc, [_title_page("Economic Survey")])
+    assert record.accession_number == "D-1087"
+
+
+def test_extracted_accession_number_already_taken_falls_back_to_auto_generated(test_db_session, tmp_storage, sample_png_bytes):
+    first = _make_document(test_db_session, tmp_storage, sample_png_bytes, filename="BOOK_A_ACC_NO.1087.png")
+    accession_service.create_accession_record_for_document(test_db_session, first, [_title_page("Book A")])
+
+    second = _make_document(test_db_session, tmp_storage, sample_png_bytes, filename="BOOK_B_ACC_NO.1087.png")
+    record = accession_service.create_accession_record_for_document(test_db_session, second, [_title_page("Book B")])
+
+    assert record.accession_number != "D-1087"  # already taken by `first` -- never a silent collision
+    # Falls back to the normal sequence -- which itself continues from the
+    # highest existing "D-N" already in the DB, including the extracted
+    # "D-1087" above, not from D-1.
+    assert record.accession_number == "D-1088"
+    assert "already assigned" in (record.extraction_notes or "")
+
+
+def test_reprocessing_never_changes_an_already_assigned_accession_number(test_db_session, tmp_storage, sample_png_bytes):
+    doc = _make_document(test_db_session, tmp_storage, sample_png_bytes, filename="BOOK_ACC_NO.1087.png")
+    first = accession_service.create_accession_record_for_document(test_db_session, doc, [_title_page("Original Title")])
+    assert first.accession_number == "D-1087"
+
+    # Reprocessing re-runs extraction against the SAME filename -- would
+    # resolve to the same "D-1087" anyway here, but the point is this path
+    # never even consults extraction for an EXISTING record's number.
+    second = accession_service.create_accession_record_for_document(test_db_session, doc, [_title_page("Corrected Title")])
+    assert second.id == first.id
+    assert second.accession_number == "D-1087"
+
+
+def test_backfill_updates_a_placeholder_number_to_the_real_one_from_the_filename(test_db_session, tmp_storage, sample_png_bytes):
+    doc = _make_document(test_db_session, tmp_storage, sample_png_bytes, filename="a_plain_name.png")
+    record = accession_service.create_accession_record_for_document(test_db_session, doc, [_title_page("Book")])
+    assert record.accession_number == "D-1"  # no ACC_NO in the filename yet -- auto-generated
+
+    doc.original_filename = "BOOK_ACC_NO.1087.png"
+    test_db_session.commit()
+
+    result = accession_service.backfill_extracted_accession_numbers(test_db_session)
+
+    assert result == {"updated": 1, "skipped_taken": 0, "unchanged": 0}
+    test_db_session.refresh(record)
+    assert record.accession_number == "D-1087"
+
+
+def test_backfill_never_overwrites_a_number_already_taken_by_another_record(test_db_session, tmp_storage, sample_png_bytes):
+    taken = _make_document(test_db_session, tmp_storage, sample_png_bytes, filename="OTHER_ACC_NO.1087.png")
+    accession_service.create_accession_record_for_document(test_db_session, taken, [_title_page("Other Book")])
+
+    doc = _make_document(test_db_session, tmp_storage, sample_png_bytes, filename="a_plain_name.png")
+    record = accession_service.create_accession_record_for_document(test_db_session, doc, [_title_page("Book")])
+    doc.original_filename = "BOOK_ACC_NO.1087.png"  # collides with `taken`'s real number
+    test_db_session.commit()
+
+    result = accession_service.backfill_extracted_accession_numbers(test_db_session)
+
+    # `taken`'s own record is already correct (unchanged); `record` is the
+    # one that would collide (skipped).
+    assert result == {"updated": 0, "skipped_taken": 1, "unchanged": 1}
+    test_db_session.refresh(record)
+    assert record.accession_number == "D-1088"  # left alone, not collided with `taken`'s "D-1087"
+
+
+def test_backfill_leaves_a_correct_or_unmatchable_number_alone(test_db_session, tmp_storage, sample_png_bytes):
+    already_correct = _make_document(test_db_session, tmp_storage, sample_png_bytes, filename="X_ACC_NO.55.png")
+    correct_record = accession_service.create_accession_record_for_document(test_db_session, already_correct, [_title_page("A")])
+    assert correct_record.accession_number == "D-55"
+
+    no_match = _make_document(test_db_session, tmp_storage, sample_png_bytes, filename="no_acc_no.png")
+    no_match_record = accession_service.create_accession_record_for_document(test_db_session, no_match, [_title_page("B")])
+
+    result = accession_service.backfill_extracted_accession_numbers(test_db_session)
+
+    assert result == {"updated": 0, "skipped_taken": 0, "unchanged": 2}
+    assert correct_record.accession_number == "D-55"
+    assert no_match_record.accession_number == "D-56"  # auto-generation continues past the highest existing number
+
+
+def test_backfill_never_lets_two_records_collide_within_the_same_run(test_db_session, tmp_storage, sample_png_bytes):
+    """Regression for a confirmed real crash: two documents uploaded from
+    the identical filename (same book uploaded twice) both auto-generated
+    placeholders, then both resolved to the SAME real number on backfill
+    -- committing that violated accession_number's UNIQUE constraint and
+    took down the whole /accession-records/refresh request with a 500,
+    since this function commits once at the end, not once per record."""
+    # Created with plain filenames -- as if processed before this feature
+    # existed at all, so both get an ordinary auto-generated placeholder,
+    # same as the real documents that hit this in production.
+    doc_a = _make_document(test_db_session, tmp_storage, sample_png_bytes, filename="a_plain_name.png")
+    record_a = accession_service.create_accession_record_for_document(test_db_session, doc_a, [_title_page("Book")])
+    doc_b = _make_document(test_db_session, tmp_storage, sample_png_bytes, filename="b_plain_name.png")
+    record_b = accession_service.create_accession_record_for_document(test_db_session, doc_b, [_title_page("Book")])
+    assert {record_a.accession_number, record_b.accession_number} == {"D-1", "D-2"}
+
+    # NOW both filenames turn out to carry the identical real ACC_NO (the
+    # same book uploaded twice) -- exactly what backfill must resolve
+    # without colliding.
+    doc_a.original_filename = "DUPLICATE_ACC_NO.1087.png"
+    doc_b.original_filename = "DUPLICATE_ACC_NO.1087.png"
+    test_db_session.commit()
+
+    result = accession_service.backfill_extracted_accession_numbers(test_db_session)  # must not raise
+
+    assert result["updated"] == 1
+    assert result["skipped_taken"] == 1
+    numbers = {record_a.accession_number, record_b.accession_number}
+    assert numbers == {"D-1087", "D-1"} or numbers == {"D-1087", "D-2"}  # exactly one claimed it, in query order
+    assert len(numbers) == 2  # never both "D-1087"

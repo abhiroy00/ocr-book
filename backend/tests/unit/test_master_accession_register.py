@@ -32,7 +32,10 @@ def _patch_storage(monkeypatch, tmp_storage):
     return tmp_storage
 
 
-def _make_completed_document(db, storage, sample_png_bytes, accession_number, book_name="Book", filename="book.png"):
+def _make_completed_document(
+    db, storage, sample_png_bytes, accession_number, book_name="Book", filename="book.png",
+    author="Test Author", publisher="Ministry Of Testing",
+):
     """A document whose (single) `ProcessingJob` is COMPLETED, with an
     `AccessionRecord` and a `SEARCHABLE_PDF` export already in place --
     exactly the state the real pipeline leaves a document in right before
@@ -44,7 +47,7 @@ def _make_completed_document(db, storage, sample_png_bytes, accession_number, bo
     job.status = DocumentStatus.COMPLETED
     db.add(AccessionRecord(
         document_id=document.id, accession_number=accession_number, book_name=book_name,
-        creator="Ministry Of Testing", language="ENGLISH", year_of_publication="2020",
+        author=author, publisher=publisher, language="ENGLISH", year_of_publication="2020",
         total_pages=document.page_count, record_date=date.today(),
     ))
     db.commit()
@@ -69,6 +72,7 @@ def test_workbook_created(tmp_storage):
 def test_header_created(tmp_storage):
     sheet = _register_sheet(reg.ensure_master_excel())
     assert [sheet.cell(row=1, column=c).value for c in range(1, len(reg.HEADERS) + 1)] == reg.HEADERS
+    assert reg.HEADERS == ["S.No", "Book Name", "Accession Number", "Author Name", "Publisher Name", "Pages", "Language"]
 
     header_cell = sheet.cell(row=1, column=1)
     assert header_cell.fill.start_color.rgb in ("003A8E2D", "3A8E2D")
@@ -85,16 +89,22 @@ def test_header_created(tmp_storage):
 # ---------------------------------------------------------------------------
 
 def test_first_row_appended(test_db_session, tmp_storage, sample_png_bytes):
-    document, _ = _make_completed_document(test_db_session, tmp_storage, sample_png_bytes, "D-1", book_name="Book One")
+    document, _ = _make_completed_document(
+        test_db_session, tmp_storage, sample_png_bytes, "D-1", book_name="Book One",
+        author="Jane Author", publisher="Acme Press",
+    )
 
     assert reg.append_document_record(test_db_session, document.id) is True
 
     sheet = _register_sheet(reg.ensure_master_excel())
     assert sheet.max_row == 2
-    assert sheet.cell(row=2, column=reg.COL_ACCESSION).value == "D-1"
+    assert sheet.cell(row=2, column=reg.COL_SNO).value == 1
     assert sheet.cell(row=2, column=reg.COL_BOOK_NAME).value == "Book One"
-    assert sheet.cell(row=2, column=reg.COL_PDF_FILENAME).value == "searchable.pdf"
-    assert sheet.cell(row=2, column=reg.COL_PDF_PATH).value == f"output/{document.id}/searchable.pdf"
+    assert sheet.cell(row=2, column=reg.COL_ACCESSION).value == "D-1"
+    assert sheet.cell(row=2, column=reg.COL_AUTHOR).value == "Jane Author"
+    assert sheet.cell(row=2, column=reg.COL_PUBLISHER).value == "Acme Press"
+    assert sheet.cell(row=2, column=reg.COL_PAGE).value == 42
+    assert sheet.cell(row=2, column=reg.COL_LANGUAGE).value == "ENGLISH"
     # Data-row formatting: wrapped, top-aligned (spec), distinct from the header's own alignment.
     assert sheet.cell(row=2, column=reg.COL_BOOK_NAME).alignment.wrap_text is True
     assert sheet.cell(row=2, column=reg.COL_BOOK_NAME).alignment.vertical == "top"
@@ -111,6 +121,8 @@ def test_second_row_appended(test_db_session, tmp_storage, sample_png_bytes):
     assert sheet.max_row == 3
     book_names = {sheet.cell(row=r, column=reg.COL_BOOK_NAME).value for r in (2, 3)}
     assert book_names == {"Book A", "Book B"}
+    # S.No renumbered 1..N to match the (accession-number-sorted) row order.
+    assert {sheet.cell(row=r, column=reg.COL_SNO).value for r in (2, 3)} == {1, 2}
 
 
 def test_duplicate_accession_number_is_skipped(test_db_session, tmp_storage, sample_png_bytes):
@@ -186,6 +198,8 @@ def test_concurrent_append_does_not_corrupt_workbook(test_db_session, tmp_storag
     assert sheet.max_row == len(documents) + 1
     accessions = {sheet.cell(row=r, column=reg.COL_ACCESSION).value for r in range(2, sheet.max_row + 1)}
     assert accessions == {f"D-{i + 1}" for i in range(6)}
+    # S.No is a contiguous 1..N sequence with no gaps/duplicates.
+    assert sorted(sheet.cell(row=r, column=reg.COL_SNO).value for r in range(2, sheet.max_row + 1)) == list(range(1, 7))
 
 
 def test_concurrent_lock_holders_never_overlap(tmp_storage):
@@ -313,11 +327,10 @@ def _store_cover_ocr(db, document, fixture_name):
 
 def test_refresh_rereads_better_metadata_and_rebuilds_the_register(test_db_session, tmp_storage, sample_png_bytes):
     document, job = _make_completed_document(
-        test_db_session, tmp_storage, sample_png_bytes, "D-3", book_name="Studies in", filename="farm.png"
+        test_db_session, tmp_storage, sample_png_bytes, "D-3", book_name="Studies in", filename="farm.png",
+        author=None, publisher="the",  # the old extractor's fragment
     )
     document.status = DocumentStatus.COMPLETED
-    record = test_db_session.query(AccessionRecord).filter_by(document_id=document.id).one()
-    record.creator = "the"  # the old extractor's fragment
     test_db_session.commit()
     _store_cover_ocr(test_db_session, document, "farm_management_pali_1973")
 
@@ -326,14 +339,12 @@ def test_refresh_rereads_better_metadata_and_rebuilds_the_register(test_db_sessi
 
     result = reg.refresh_register_details(test_db_session)
 
-    assert result == {"documents_refreshed": 1, "documents_failed": 0, "register_rows": 1}
+    assert result == {"documents_refreshed": 1, "documents_failed": 0, "accession_numbers_updated": 0, "register_rows": 1}
     sheet = _register_sheet(reg.ensure_master_excel())
     assert sheet.max_row == 2  # rebuilt, not duplicated
     assert sheet.cell(row=2, column=reg.COL_ACCESSION).value == "D-3"  # accession numbers never change
     assert sheet.cell(row=2, column=reg.COL_BOOK_NAME).value.startswith("Studies in the Economics of Farm Management")
-    assert sheet.cell(row=2, column=reg.COL_CREATOR).value == "Mrs. Kusum Rathore / Bhupal Singh Rathore / Dr. Ram K. Patel"
-    assert sheet.cell(row=2, column=reg.COL_YEAR).value == "1973"
-    assert sheet.cell(row=2, column=reg.COL_PDF_FILENAME).value == "searchable.pdf"
+    assert sheet.cell(row=2, column=reg.COL_AUTHOR).value == "Mrs. Kusum Rathore / Bhupal Singh Rathore / Dr. Ram K. Patel"
 
 
 def test_refresh_leaves_documents_without_stored_pages_alone(test_db_session, tmp_storage, sample_png_bytes):
@@ -346,3 +357,65 @@ def test_refresh_leaves_documents_without_stored_pages_alone(test_db_session, tm
     assert result["documents_refreshed"] == 0
     record = test_db_session.query(AccessionRecord).filter_by(document_id=document.id).one()
     assert record.book_name == "Kept As Is"
+
+
+# ---------------------------------------------------------------------------
+# Schema-mismatch auto-recovery (a stale header from an older column layout
+# must never be silently reused with new-layout row data underneath it)
+# ---------------------------------------------------------------------------
+
+def test_a_stale_header_from_an_older_schema_triggers_a_rebuild(tmp_storage):
+    from openpyxl import Workbook as _WB
+
+    path = reg.ensure_master_excel()
+    stale = _WB()
+    sheet = stale.active
+    sheet.title = reg.SHEET_NAME
+    # An old, no-longer-current header shape (fewer/differently-ordered columns).
+    for col_idx, label in enumerate(["Date", "Accession Number", "Book Name"], start=1):
+        sheet.cell(row=1, column=col_idx, value=label)
+    sheet.cell(row=2, column=1, value="stale garbage row")
+    stale.save(path)
+
+    fixed_path = reg.ensure_master_excel()
+
+    sheet = _register_sheet(fixed_path)
+    assert [sheet.cell(row=1, column=c).value for c in range(1, len(reg.HEADERS) + 1)] == reg.HEADERS
+    assert sheet.max_row == 1  # the stale row is gone, not misaligned under the new header
+
+
+def test_an_up_to_date_header_is_left_alone(tmp_storage):
+    path = reg.ensure_master_excel()
+    wb = load_workbook(path)
+    wb[reg.SHEET_NAME].cell(row=2, column=reg.COL_BOOK_NAME, value="Untouched")
+    wb.save(path)
+
+    second_path = reg.ensure_master_excel()
+
+    assert second_path == path
+    assert _register_sheet(second_path).cell(row=2, column=reg.COL_BOOK_NAME).value == "Untouched"
+
+
+def test_sync_repopulates_after_a_schema_rebuild(test_db_session, tmp_storage, sample_png_bytes):
+    """The realistic end-to-end recovery path: an old-schema file gets
+    rebuilt blank by `ensure_master_excel`, and the very next DB-aware
+    call (here, the download route's own sync) repopulates it correctly
+    -- no document is permanently lost, only the stale/misaligned copy."""
+    from openpyxl import Workbook as _WB
+
+    document, _ = _make_completed_document(test_db_session, tmp_storage, sample_png_bytes, "D-1", "Book One")
+
+    path = reg.ensure_master_excel()
+    stale = _WB()
+    sheet = stale.active
+    sheet.title = reg.SHEET_NAME
+    sheet.cell(row=1, column=1, value="Some Old Column")
+    stale.save(path)
+
+    data = reg.get_master_register_bytes(test_db_session)
+
+    from io import BytesIO
+
+    sheet = load_workbook(BytesIO(data))[reg.SHEET_NAME]
+    assert [sheet.cell(row=1, column=c).value for c in range(1, len(reg.HEADERS) + 1)] == reg.HEADERS
+    assert sheet.cell(row=2, column=reg.COL_ACCESSION).value == "D-1"

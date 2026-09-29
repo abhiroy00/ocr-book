@@ -20,7 +20,7 @@ from app.models.accession_record import AccessionRecord
 from app.models.document import Document
 from app.schemas.document_json import PageJSON
 from app.schemas.ocr import OCRWordResult
-from app.services.accession_extractor import extract_book_metadata
+from app.services.accession_extractor import extract_accession_number_from_filename, extract_book_metadata
 
 logger = get_logger(__name__)
 
@@ -58,25 +58,61 @@ def create_accession_record_for_document(
     reprocessing the SAME document updates its existing row in place
     (re-extracting from the fresh pipeline output) rather than appending a
     second row for the same source file, so the master dataset never
-    double-counts a document (spec section 6: append, never duplicate)."""
+    double-counts a document (spec section 6: append, never duplicate).
+
+    Accession number: the caller's `accession_number` argument (if given)
+    wins; otherwise a real one is used if `extract_book_metadata` found it
+    printed on the book itself (filename or a stamped "ACC.NO." on the
+    cover -- see `accession_extractor._extract_accession_number`); only
+    when NEITHER is available does this fall back to the next sequential
+    `{prefix}-N`. A REPROCESS never changes an already-assigned number,
+    even if the fresh extraction disagrees -- that would silently
+    renumber a book already catalogued under the old one."""
     metadata = extract_book_metadata(document.original_filename, pages, words_by_page)
 
     existing = db.scalar(select(AccessionRecord).where(AccessionRecord.document_id == document.id))
+
+    resolved_number = accession_number or metadata.accession_number
+    if resolved_number and not existing:
+        taken_by = db.scalar(
+            select(AccessionRecord).where(
+                AccessionRecord.accession_number == resolved_number,
+                AccessionRecord.document_id != document.id,
+            )
+        )
+        if taken_by is not None:
+            # A misread digit or two documents genuinely sharing a stamped
+            # number -- never silently collide with (or overwrite) another
+            # document's row; fall back to auto-generation instead.
+            logger.warning(
+                "extracted_accession_number_already_taken", document_id=document.id,
+                accession_number=resolved_number, taken_by_document_id=taken_by.document_id,
+            )
+            metadata.notes.append(
+                f"accession_number: extracted '{resolved_number}' is already assigned to another document; generated a new one instead"
+            )
+            resolved_number = None
+
     if existing:
         record = existing
         record.book_name = metadata.book_name
         record.creator = metadata.creator
+        record.author = metadata.author
+        record.publisher = metadata.publisher
         record.language = metadata.language
         record.year_of_publication = metadata.year_of_publication
         record.total_pages = document.page_count
         record.needs_review = metadata.needs_review
         record.extraction_notes = metadata.notes_text
+        # accession_number is deliberately left untouched here.
     else:
         record = AccessionRecord(
             document_id=document.id,
-            accession_number=accession_number or generate_next_accession_number(db),
+            accession_number=resolved_number or generate_next_accession_number(db),
             book_name=metadata.book_name,
             creator=metadata.creator,
+            author=metadata.author,
+            publisher=metadata.publisher,
             language=metadata.language,
             year_of_publication=metadata.year_of_publication,
             total_pages=document.page_count,
@@ -93,6 +129,66 @@ def create_accession_record_for_document(
         needs_review=record.needs_review,
     )
     return record
+
+
+def backfill_extracted_accession_numbers(db: Session) -> dict:
+    """Explicit, opt-in correction for records still holding an
+    auto-generated placeholder from before this project could read a real
+    accession number at all (filename-only -- see
+    `accession_extractor.extract_accession_number_from_filename`; the
+    cover-OCR fallback needs full page data and isn't worth reloading for
+    every record here, so a book without an ACC_NO-bearing filename just
+    keeps its current number).
+
+    Deliberately NOT part of `create_accession_record_for_document`'s
+    normal reprocess path, which never touches an existing record's
+    number on purpose (renumbering an already-catalogued book on routine
+    reprocess would be wrong) -- this is a one-off, explicitly invoked
+    migration for records that were never given the chance to have a real
+    number in the first place. Never overwrites a number that's already
+    correct, and never collides with a DIFFERENT record's number --
+    including two records in this SAME run resolving to the same target
+    (e.g. the same book uploaded twice, both filenames carrying the
+    identical ACC_NO): confirmed as a real crash otherwise -- this
+    function only commits once at the end (one atomic pass, not N), so an
+    in-DB `taken_by` check alone can't see an EARLIER record's not-yet-
+    flushed reassignment from later in the same loop, and two records
+    landing on the same number blows the column's UNIQUE constraint at
+    commit time, failing the whole batch instead of just that one row.
+    `_reserved_this_run` closes that gap without needing a flush per row."""
+    updated = skipped_taken = unchanged = 0
+    reserved_this_run: set[str] = set()
+    for record in db.scalars(select(AccessionRecord)).all():
+        document = db.get(Document, record.document_id)
+        if document is None:
+            continue
+        extracted = extract_accession_number_from_filename(document.original_filename)
+        if extracted is None or extracted == record.accession_number:
+            unchanged += 1
+            continue
+        taken_by = db.scalar(
+            select(AccessionRecord).where(
+                AccessionRecord.accession_number == extracted, AccessionRecord.id != record.id
+            )
+        )
+        if taken_by is not None or extracted in reserved_this_run:
+            logger.warning(
+                "accession_number_backfill_collision", document_id=document.id,
+                current=record.accession_number, extracted=extracted,
+                taken_by_document_id=getattr(taken_by, "document_id", None),
+            )
+            skipped_taken += 1
+            continue
+        logger.info(
+            "accession_number_backfilled", document_id=document.id,
+            old=record.accession_number, new=extracted,
+        )
+        record.accession_number = extracted
+        reserved_this_run.add(extracted)
+        updated += 1
+
+    db.commit()
+    return {"updated": updated, "skipped_taken": skipped_taken, "unchanged": unchanged}
 
 
 def list_accession_records(

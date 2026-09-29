@@ -1,5 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { MemoryRouter } from "react-router-dom";
 import UploadPage from "@/pages/UploadPage";
 import { batchApi } from "@/services/batchApi";
@@ -9,7 +10,21 @@ vi.mock("@/services/api", () => ({
   fileUrl: (p: string) => p,
 }));
 vi.mock("@/services/batchApi", () => ({
-  batchApi: { create: vi.fn(), addFile: vi.fn(), start: vi.fn() },
+  batchApi: {
+    create: vi.fn(),
+    addFile: vi.fn(),
+    start: vi.fn(),
+    // UploadPage fetches this (for the per-file size limit) via react-query
+    // on mount; a generous limit here means it never interferes with these
+    // tests' own files, which are tiny.
+    capacity: vi.fn().mockResolvedValue({
+      concurrency: { provider: "paddleocr", limit: 2, limiting_factor: "cpu", cpu_count: 4, total_mem_mb: 8192, bounds: {} },
+      max_files: 50,
+      max_total_mb: 5000,
+      max_file_mb: 1024,
+      allowed_extensions: [".pdf", ".jpg", ".jpeg", ".png", ".webp"],
+    }),
+  },
 }));
 
 const mockedNavigate = vi.fn();
@@ -21,11 +36,15 @@ vi.mock("react-router-dom", async () => {
 const pdf = (name: string) => new File(["%PDF-1.4"], name, { type: "application/pdf" });
 
 function renderPage() {
-  return render(
-    <MemoryRouter>
-      <UploadPage />
-    </MemoryRouter>,
+  const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+  const result = render(
+    <QueryClientProvider client={client}>
+      <MemoryRouter>
+        <UploadPage />
+      </MemoryRouter>
+    </QueryClientProvider>,
   );
+  return { ...result, client };
 }
 
 function openMultiple() {
@@ -60,6 +79,27 @@ describe("UploadPage — Multiple PDF OCR", () => {
     expect(screen.getByText("b.pdf")).toBeInTheDocument();
     expect(screen.getByText(/Unsupported file type: virus\.exe/)).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Process 2 files" })).not.toBeDisabled();
+  });
+
+  it("rejects a file over the server's per-file size limit before ever uploading it", async () => {
+    const { client } = renderPage();
+    openMultiple();
+    // Wait for the mocked GET /batches/capacity (max_file_mb: 1024) to
+    // actually resolve and land in the query cache -- merely having been
+    // *called* isn't enough: the size check below needs the resolved
+    // limit, and the promise/react-query/re-render chain takes a few
+    // microtask ticks after that call to actually settle.
+    await waitFor(() => expect(client.getQueryData(["batchCapacity"])).toBeTruthy());
+
+    const oversized = pdf("huge_scan.pdf");
+    Object.defineProperty(oversized, "size", { value: 1100 * 1024 * 1024, configurable: true }); // 1100MB > the 1024MB mocked limit
+    pick([pdf("a.pdf"), oversized]);
+
+    expect(screen.getByText("1 file selected")).toBeInTheDocument();
+    expect(screen.getByText("a.pdf")).toBeInTheDocument();
+    expect(screen.queryByText("huge_scan.pdf")).toBeNull();
+    expect(screen.getByText(/Too large \(max 1024MB\): huge_scan\.pdf/)).toBeInTheDocument();
+    expect(batchApi.addFile).not.toHaveBeenCalled();
   });
 
   it("removes a file from the selection", () => {

@@ -225,7 +225,12 @@ def remove_background(image: np.ndarray) -> np.ndarray:
             normalized_ch = (channel / bg_blur_ch) * 255.0
             normalized_ch = np.clip(normalized_ch, 0, 255).astype(np.uint8)
             result[:, :, c] = normalized_ch
-        return result
+        # `result` was allocated as float32 (needed while accumulating
+        # per-channel division results above) and was never cast back --
+        # every downstream preprocessing step (enhance_contrast's CLAHE
+        # in particular) requires uint8/uint16 and raises a cv2.error on
+        # a float32 image, so a color page never got past this point.
+        return result.astype(np.uint8)
 
     return normalized
 

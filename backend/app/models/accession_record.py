@@ -45,7 +45,18 @@ class AccessionRecord(TimestampMixin, Base):
     # confidently read is left blank/null with `needs_review` set, rather
     # than guessed (spec section 14).
     book_name: Mapped[str] = mapped_column(Text, nullable=False)
+    # `creator` predates the author/publisher split below and is kept for
+    # the existing DB-backed detailed export's "Organisation / Author
+    # Name" column: author if one was found, else publisher (see
+    # `accession_extractor.ExtractedMetadata.creator`).
     creator: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    # Personal author name(s) (e.g. "Mrs. Kusum Rathore / Bhupal Singh
+    # Rathore") and the issuing/publishing body (e.g. "OXFORD & IBH
+    # PUBLISHIING CO. DELHI") -- independent fields because a real cover
+    # often carries both, and the Master Accession Register wants them
+    # as separate columns.
+    author: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    publisher: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     language: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
     year_of_publication: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
     # Denormalized copy of document.page_count -- always exact (no OCR

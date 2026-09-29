@@ -1,4 +1,5 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useState } from "react";
+import axios from "axios";
 import { documentsApi, wsUrlForDocument } from "@/services/api";
 import type { ProgressEvent } from "@/types/document";
 
@@ -12,19 +13,35 @@ const TERMINAL_STATUSES = new Set(["COMPLETED", "FAILED", "CANCELLED"]);
  * (`/ws/documents/{id}`) and falls back to polling `GET .../progress` every
  * 2s if the socket can't connect or drops — the UI never gets stuck with no
  * progress signal just because a proxy/browser blocked the WS.
+ *
+ * The fallback only ever runs while this effect is live and the job hasn't
+ * reached a terminal state: the socket's `close` event fires asynchronously
+ * AFTER cleanup (and after our own close on a terminal event), and starting
+ * a poll from there used to leak an interval nobody cleared -- it kept
+ * hitting `/progress` every 2s, even after leaving the page, forever if
+ * that request 404'd. A 4xx is also final: the document/job isn't there, and
+ * asking again every 2s can't change that.
  */
 export function useDocumentProgress(documentId: string | undefined, enabled: boolean) {
   const [event, setEvent] = useState<ProgressEvent | null>(null);
-  const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   useEffect(() => {
     if (!documentId || !enabled) return;
     let cancelled = false;
+    let finished = false;
     let socket: WebSocket | null = null;
+    let poll: ReturnType<typeof setInterval> | null = null;
+
+    const stopPolling = () => {
+      if (poll) {
+        clearInterval(poll);
+        poll = null;
+      }
+    };
 
     const startPolling = () => {
-      if (pollRef.current) return;
-      pollRef.current = setInterval(async () => {
+      if (poll || cancelled || finished) return;
+      poll = setInterval(async () => {
         try {
           const job = await documentsApi.progress(documentId);
           if (cancelled) return;
@@ -37,12 +54,17 @@ export function useDocumentProgress(documentId: string | undefined, enabled: boo
             message: job.error_message || "",
             status: job.status,
           });
-          if (TERMINAL_STATUSES.has(job.status) && pollRef.current) {
-            clearInterval(pollRef.current);
-            pollRef.current = null;
+          if (TERMINAL_STATUSES.has(job.status)) {
+            finished = true;
+            stopPolling();
           }
-        } catch {
-          // Backend not reachable yet (job may not exist); keep polling.
+        } catch (err) {
+          const status = axios.isAxiosError(err) ? err.response?.status : undefined;
+          if (status !== undefined && status >= 400 && status < 500) {
+            finished = true;
+            stopPolling();
+          }
+          // Otherwise (network error / 5xx): transient, keep polling.
         }
       }, 2000);
     };
@@ -54,7 +76,10 @@ export function useDocumentProgress(documentId: string | undefined, enabled: boo
         try {
           const parsed = JSON.parse(msg.data) as ProgressEvent;
           setEvent(parsed);
-          if (TERMINAL_STATUSES.has(parsed.status)) socket?.close();
+          if (TERMINAL_STATUSES.has(parsed.status)) {
+            finished = true;
+            socket?.close();
+          }
         } catch {
           /* ignore malformed frame */
         }
@@ -68,10 +93,7 @@ export function useDocumentProgress(documentId: string | undefined, enabled: boo
     return () => {
       cancelled = true;
       socket?.close();
-      if (pollRef.current) {
-        clearInterval(pollRef.current);
-        pollRef.current = null;
-      }
+      stopPolling();
     };
   }, [documentId, enabled]);
 

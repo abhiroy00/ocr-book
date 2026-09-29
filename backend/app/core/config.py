@@ -60,7 +60,14 @@ class Settings(BaseSettings):
     s3_region: str = "us-east-1"
 
     # --- Upload ---
-    max_upload_size_mb: int = 200
+    # Raised from 200 -- real scanned legal/statute compilations in this
+    # project's corpus (e.g. "The India Code" volumes) run to 700MB+ as a
+    # single PDF; 200 (and the 500 most deployments override this to via
+    # .env) rejected those outright. Must stay <= nginx's own
+    # `client_max_body_size` (docker/frontend/nginx.prod.conf,
+    # docker/nginx/nginx.conf) or nginx rejects the upload before this
+    # setting is ever consulted.
+    max_upload_size_mb: int = 1024
     allowed_upload_extensions: str = ".pdf,.jpg,.jpeg,.png,.webp"
 
     # --- Rendering / preprocessing ---
@@ -95,12 +102,22 @@ class Settings(BaseSettings):
     # --- Workers ---
     celery_worker_concurrency: int = 4
 
-# --- Page size / reconstruction ---
-# Preserve original page dimensions by default (do NOT force A4 by default).
-# Set to False to normalize all output pages to A4 (optional mode).
-preserve_original_page_size: bool = True
+    # --- Page size / reconstruction ---
+    # Preserve original page dimensions by default (do NOT force A4 by default).
+    # Set to False to normalize all output pages to A4 (optional mode).
+    preserve_original_page_size: bool = True
 
-# Upper ceiling used when OCR_WORKERS is left at its auto default (0)
+    # --- Page-level OCR parallelism (controlled worker pool, not one
+    # process per page -- see app.workers.page_worker_pool) ---
+    # 0 means "pick a sensible default from CPU count at pipeline start"
+    # (see Settings.resolved_ocr_workers) rather than hardcoding a number
+    # here that would be wrong on both a 2-core laptop and a 32-core
+    # server. PaddleOCR/OpenCV work is CPU-bound native code with no GIL
+    # release, so this pool is process-based, not thread-based -- each
+    # worker's memory cost (a loaded OCR model) is real, so this must stay
+    # a deliberate, bounded number, never one-per-page.
+    ocr_workers: int = 0
+    # Upper ceiling used when OCR_WORKERS is left at its auto default (0)
     # -- the literal throughput target, e.g. 10 on a 14-core host. See
     # `resolved_ocr_workers`: this is a REQUEST, not a guarantee, since
     # actual available RAM at pipeline start might not support it.
@@ -170,10 +187,20 @@ preserve_original_page_size: bool = True
     # PDF bytes + a few page buffers). Paddle uses OCR_WORKER_EST_MEMORY_MB
     # instead. Estimate; verify on your own host before relying on it.
     batch_light_engine_est_memory_mb: int = 700
-    batch_max_files: int = 20
+    # Raised from 20 -- a real use case in this project's corpus is
+    # uploading 60-70 books in one batch; they still process one-by-one
+    # (bounded by resolved_ocr_workers/concurrency slots below, never all
+    # at once), so a low file-count cap here was blocking a legitimate
+    # workload for no corresponding safety benefit.
+    batch_max_files: int = 500
     # Sum of all files' sizes in one batch -- bounds uncontrolled disk use
     # (each uploaded original is persisted before processing starts).
-    batch_max_total_mb: int = 2048
+    # Raised from 2048 (2GB): individual scanned legal/statute volumes in
+    # this corpus already run to 700MB+ (see MAX_UPLOAD_SIZE_MB), so a
+    # 2GB batch cap was rejecting well under 10 such files. Real disk
+    # exhaustion is still guarded separately and per-file, not by this
+    # aggregate number, via BATCH_DISK_RESERVE_MB below.
+    batch_max_total_mb: int = 102400
     # Free-disk headroom required before accepting another file, on local
     # storage: a fixed reserve plus an estimate of the page images one page
     # of output costs (original + processed PNG per page at 150-300 DPI).

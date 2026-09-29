@@ -16,6 +16,7 @@ import fitz  # PyMuPDF
 from app.core.config import get_settings
 from app.core.logging import get_logger
 from app.models.enums import LayoutBlockType, TextAlign
+from app.reconstruction.fonts import resolve_body_font_path
 from app.reconstruction.page_transform import (
     compute_page_transform,
     transform_block_to_a4,

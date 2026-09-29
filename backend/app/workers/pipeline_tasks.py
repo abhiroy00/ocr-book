@@ -457,8 +457,24 @@ def _run_sequential_fallback(
 
                 words = _run_ocr_page(ocr_worker, processed_image, page_number, dpi)
                 tables = _detect_tables_safely(processed_image, words, rendered.width, rendered.height)
-                layout_results = layout_detector.detect(processed_image, rendered.image, words, tables, rendered.width, rendered.height)
-                _crop_and_attach_graphic_images(storage, document.id, page_number, rendered.image, processed_image, layout_results)
+                # Both args must be `processed_image`, not `rendered.image`
+                # (the pre-deskew/pre-crop raw scan): OCR ran on
+                # `processed_image`, so `words` bboxes are already in its
+                # coordinate frame. Passing the raw scan here put graphic-
+                # region bboxes in a DIFFERENT (un-rotated) frame, so
+                # cropping them out of `processed_image` afterward grabbed
+                # a skewed/misaligned rectangle whenever a page actually
+                # needed deskewing -- confirmed against real output: a map
+                # rendered rotated within its own crop, with black wedge
+                # corners where the rotation didn't fill the rectangle.
+                layout_results = layout_detector.detect(processed_image, processed_image, words, tables, rendered.width, rendered.height)
+                # Graphics are cropped from the raw full-colour scan only when
+                # preprocessing left its geometry untouched (no rotate/deskew/
+                # border crop), so the processed-frame bboxes still line up.
+                _crop_and_attach_graphic_images(
+                    storage, document.id, page_number, rendered.image, processed_image, layout_results,
+                    geometry_unchanged=_geometry_unchanged(preproc, rendered.image, processed_image),
+                )
 
                 result = PageWorkResult(
                     page_number=page_number, width=rendered.width, height=rendered.height, dpi=rendered.dpi,
@@ -515,15 +531,28 @@ def _detect_tables_safely(image, words, width, height):
         return []
 
 
-def _crop_and_attach_graphic_images(storage, document_id: str, page_number: int, original_image, processed_image, layout_results) -> None:
+def _geometry_unchanged(preproc, original_image, processed_image) -> bool:
+    return (
+        preproc.rotation_applied_deg == 0.0
+        and preproc.skew_angle_deg == 0.0
+        and original_image.shape[:2] == processed_image.shape[:2]
+    )
+
+
+def _crop_and_attach_graphic_images(
+    storage, document_id: str, page_number: int, original_image, processed_image, layout_results, geometry_unchanged: bool = False
+) -> None:
+    # `layout_results` bboxes are in `processed_image`'s frame; the raw scan
+    # is only a valid crop source when that frame matches it exactly.
+    source_image = original_image if geometry_unchanged else processed_image
     for i, result in enumerate(layout_results):
         if result.block_type not in _GRAPHIC_TYPES:
             continue
         x1, y1 = max(0, int(result.bbox.x1)), max(0, int(result.bbox.y1))
-        x2, y2 = min(original_image.shape[1], int(result.bbox.x2)), min(original_image.shape[0], int(result.bbox.y2))
+        x2, y2 = min(source_image.shape[1], int(result.bbox.x2)), min(source_image.shape[0], int(result.bbox.y2))
         if x2 <= x1 or y2 <= y1:
             continue
-        crop = original_image[y1:y2, x1:x2]  # Crop from original, NOT processed
+        crop = source_image[y1:y2, x1:x2]
         rel_path = f"processed/{document_id}/page_{page_number:04d}_block_{i:04d}.png"
         storage.write(rel_path, _encode_png(crop))
         result.image_ref = rel_path
