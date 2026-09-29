@@ -636,7 +636,12 @@ def refresh_register_details(db: Session) -> dict[str, int]:
             failed += 1
             logger.error("master_register_refresh_failed", document_id=document.id, error=str(exc))
 
-    accession_backfill = accession_service.backfill_extracted_accession_numbers(db)
+    try:
+        accession_backfill = accession_service.backfill_extracted_accession_numbers(db)
+    except Exception as exc:  # noqa: BLE001 - the whole refresh (already-completed metadata work above) must not be lost over this
+        db.rollback()
+        logger.error("accession_number_backfill_failed", error=str(exc))
+        accession_backfill = {"updated": 0}
 
     return {
         "documents_refreshed": refreshed,

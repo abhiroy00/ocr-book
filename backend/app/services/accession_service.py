@@ -146,8 +146,18 @@ def backfill_extracted_accession_numbers(db: Session) -> dict:
     reprocess would be wrong) -- this is a one-off, explicitly invoked
     migration for records that were never given the chance to have a real
     number in the first place. Never overwrites a number that's already
-    correct, and never collides with a DIFFERENT record's number."""
+    correct, and never collides with a DIFFERENT record's number --
+    including two records in this SAME run resolving to the same target
+    (e.g. the same book uploaded twice, both filenames carrying the
+    identical ACC_NO): confirmed as a real crash otherwise -- this
+    function only commits once at the end (one atomic pass, not N), so an
+    in-DB `taken_by` check alone can't see an EARLIER record's not-yet-
+    flushed reassignment from later in the same loop, and two records
+    landing on the same number blows the column's UNIQUE constraint at
+    commit time, failing the whole batch instead of just that one row.
+    `_reserved_this_run` closes that gap without needing a flush per row."""
     updated = skipped_taken = unchanged = 0
+    reserved_this_run: set[str] = set()
     for record in db.scalars(select(AccessionRecord)).all():
         document = db.get(Document, record.document_id)
         if document is None:
@@ -161,10 +171,11 @@ def backfill_extracted_accession_numbers(db: Session) -> dict:
                 AccessionRecord.accession_number == extracted, AccessionRecord.id != record.id
             )
         )
-        if taken_by is not None:
+        if taken_by is not None or extracted in reserved_this_run:
             logger.warning(
                 "accession_number_backfill_collision", document_id=document.id,
-                current=record.accession_number, extracted=extracted, taken_by_document_id=taken_by.document_id,
+                current=record.accession_number, extracted=extracted,
+                taken_by_document_id=getattr(taken_by, "document_id", None),
             )
             skipped_taken += 1
             continue
@@ -173,6 +184,7 @@ def backfill_extracted_accession_numbers(db: Session) -> dict:
             old=record.accession_number, new=extracted,
         )
         record.accession_number = extracted
+        reserved_this_run.add(extracted)
         updated += 1
 
     db.commit()

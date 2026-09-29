@@ -220,3 +220,35 @@ def test_backfill_leaves_a_correct_or_unmatchable_number_alone(test_db_session, 
     assert result == {"updated": 0, "skipped_taken": 0, "unchanged": 2}
     assert correct_record.accession_number == "D-55"
     assert no_match_record.accession_number == "D-56"  # auto-generation continues past the highest existing number
+
+
+def test_backfill_never_lets_two_records_collide_within_the_same_run(test_db_session, tmp_storage, sample_png_bytes):
+    """Regression for a confirmed real crash: two documents uploaded from
+    the identical filename (same book uploaded twice) both auto-generated
+    placeholders, then both resolved to the SAME real number on backfill
+    -- committing that violated accession_number's UNIQUE constraint and
+    took down the whole /accession-records/refresh request with a 500,
+    since this function commits once at the end, not once per record."""
+    # Created with plain filenames -- as if processed before this feature
+    # existed at all, so both get an ordinary auto-generated placeholder,
+    # same as the real documents that hit this in production.
+    doc_a = _make_document(test_db_session, tmp_storage, sample_png_bytes, filename="a_plain_name.png")
+    record_a = accession_service.create_accession_record_for_document(test_db_session, doc_a, [_title_page("Book")])
+    doc_b = _make_document(test_db_session, tmp_storage, sample_png_bytes, filename="b_plain_name.png")
+    record_b = accession_service.create_accession_record_for_document(test_db_session, doc_b, [_title_page("Book")])
+    assert {record_a.accession_number, record_b.accession_number} == {"D-1", "D-2"}
+
+    # NOW both filenames turn out to carry the identical real ACC_NO (the
+    # same book uploaded twice) -- exactly what backfill must resolve
+    # without colliding.
+    doc_a.original_filename = "DUPLICATE_ACC_NO.1087.png"
+    doc_b.original_filename = "DUPLICATE_ACC_NO.1087.png"
+    test_db_session.commit()
+
+    result = accession_service.backfill_extracted_accession_numbers(test_db_session)  # must not raise
+
+    assert result["updated"] == 1
+    assert result["skipped_taken"] == 1
+    numbers = {record_a.accession_number, record_b.accession_number}
+    assert numbers == {"D-1087", "D-1"} or numbers == {"D-1087", "D-2"}  # exactly one claimed it, in query order
+    assert len(numbers) == 2  # never both "D-1087"
