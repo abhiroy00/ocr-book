@@ -5,6 +5,8 @@ value it can't support from the document's own content -- every "no
 usable X found" path must leave that field blank/null and set
 `needs_review`, not guess.
 """
+import pytest
+
 from app.schemas.document_json import DocumentBlockJSON, PageJSON, TextRunJSON
 from app.schemas.geometry import BBox, NormBBox
 from app.schemas.ocr import OCRWordResult
@@ -131,3 +133,53 @@ def test_only_scans_the_first_few_pages_not_the_whole_document():
     deep_page = _page(50, [_block("title", "A Random Heading On Page 50 1975", z_order=0)])
     result = extract_book_metadata("fallback.pdf", [title_page, deep_page])
     assert result.book_name == "The Real Title"
+
+
+# ---------------------------------------------------------------------------
+# Accession number: filename first, cover OCR text second, else None
+# ---------------------------------------------------------------------------
+
+def test_accession_number_extracted_from_filename():
+    page = _page(1, [_block("title", "Economic Survey 2015-16", z_order=0)])
+    result = extract_book_metadata("ECONOMIC_SURVEY_2015-16_ACC_NO._1087_X.pdf", [page])
+    assert result.accession_number == "D-1087"
+
+
+@pytest.mark.parametrize("filename,expected", [
+    ("MACROECONOMIC_POLICY_ACC_NO.10693.pdf", "D-10693"),
+    ("THEORIES_OF_PRODUCTION_ACC_NO-3606_.pdf", "D-3606"),
+    ("SAVING BEHAVIOUR IN INDIA ACC NO 8916.pdf", "D-8916"),
+    ("ECONOMIC OF TREES(ACC NO-8957).pdf", "D-8957"),
+])
+def test_accession_number_filename_patterns(filename, expected):
+    result = extract_book_metadata(filename, [_page(1, [])])
+    assert result.accession_number == expected
+
+
+def test_accession_number_falls_back_to_none_without_a_filename_or_cover_match():
+    # Every OTHER field is confidently readable here (title, a publisher
+    # line, a year, and English words for language) -- isolates that a
+    # MISSING accession number alone does not flip needs_review, unlike
+    # book_name/author-publisher/year/language, which still do.
+    page = _page(1, [
+        _block("title", "STATISTICAL ABSTRACT OF PUNJAB 2003", z_order=0),
+        _block("heading", "MINISTRY OF AGRICULTURE", z_order=1),
+    ])
+    words_by_page = {1: [_word("Statistical", "en"), _word("Abstract", "en")]}
+    result = extract_book_metadata("no_acc_no_here.pdf", [page], words_by_page)
+
+    assert result.accession_number is None
+    assert any("accession_number" in n for n in result.notes)
+    assert result.needs_review is False
+
+
+def test_accession_number_extracted_from_a_stamped_cover_line():
+    page = _page(1, [_block("paragraph", "Economics Statistics ACC.NO. D-1087 Library", z_order=0)])
+    result = extract_book_metadata("fallback.pdf", [page])
+    assert result.accession_number == "D-1087"
+
+
+def test_accession_number_filename_wins_over_a_conflicting_cover_stamp():
+    page = _page(1, [_block("paragraph", "ACC.NO. D-9999", z_order=0)])
+    result = extract_book_metadata("BOOK_ACC_NO.1087.pdf", [page])
+    assert result.accession_number == "D-1087"

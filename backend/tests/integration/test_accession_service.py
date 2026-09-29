@@ -138,3 +138,37 @@ def test_accession_summary_counts(test_db_session, tmp_storage, sample_png_bytes
     assert summary["needs_review_count"] == 1
     assert summary["total_documents_processed"] == 2
     assert summary["latest_record_date"] == date.today()
+
+
+def test_accession_number_from_filename_is_used_instead_of_auto_generated(test_db_session, tmp_storage, sample_png_bytes):
+    doc = _make_document(test_db_session, tmp_storage, sample_png_bytes, filename="ECONOMIC_SURVEY_ACC_NO.1087.png")
+    record = accession_service.create_accession_record_for_document(test_db_session, doc, [_title_page("Economic Survey")])
+    assert record.accession_number == "D-1087"
+
+
+def test_extracted_accession_number_already_taken_falls_back_to_auto_generated(test_db_session, tmp_storage, sample_png_bytes):
+    first = _make_document(test_db_session, tmp_storage, sample_png_bytes, filename="BOOK_A_ACC_NO.1087.png")
+    accession_service.create_accession_record_for_document(test_db_session, first, [_title_page("Book A")])
+
+    second = _make_document(test_db_session, tmp_storage, sample_png_bytes, filename="BOOK_B_ACC_NO.1087.png")
+    record = accession_service.create_accession_record_for_document(test_db_session, second, [_title_page("Book B")])
+
+    assert record.accession_number != "D-1087"  # already taken by `first` -- never a silent collision
+    # Falls back to the normal sequence -- which itself continues from the
+    # highest existing "D-N" already in the DB, including the extracted
+    # "D-1087" above, not from D-1.
+    assert record.accession_number == "D-1088"
+    assert "already assigned" in (record.extraction_notes or "")
+
+
+def test_reprocessing_never_changes_an_already_assigned_accession_number(test_db_session, tmp_storage, sample_png_bytes):
+    doc = _make_document(test_db_session, tmp_storage, sample_png_bytes, filename="BOOK_ACC_NO.1087.png")
+    first = accession_service.create_accession_record_for_document(test_db_session, doc, [_title_page("Original Title")])
+    assert first.accession_number == "D-1087"
+
+    # Reprocessing re-runs extraction against the SAME filename -- would
+    # resolve to the same "D-1087" anyway here, but the point is this path
+    # never even consults extraction for an EXISTING record's number.
+    second = accession_service.create_accession_record_for_document(test_db_session, doc, [_title_page("Corrected Title")])
+    assert second.id == first.id
+    assert second.accession_number == "D-1087"

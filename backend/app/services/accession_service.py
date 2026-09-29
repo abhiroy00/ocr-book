@@ -58,10 +58,41 @@ def create_accession_record_for_document(
     reprocessing the SAME document updates its existing row in place
     (re-extracting from the fresh pipeline output) rather than appending a
     second row for the same source file, so the master dataset never
-    double-counts a document (spec section 6: append, never duplicate)."""
+    double-counts a document (spec section 6: append, never duplicate).
+
+    Accession number: the caller's `accession_number` argument (if given)
+    wins; otherwise a real one is used if `extract_book_metadata` found it
+    printed on the book itself (filename or a stamped "ACC.NO." on the
+    cover -- see `accession_extractor._extract_accession_number`); only
+    when NEITHER is available does this fall back to the next sequential
+    `{prefix}-N`. A REPROCESS never changes an already-assigned number,
+    even if the fresh extraction disagrees -- that would silently
+    renumber a book already catalogued under the old one."""
     metadata = extract_book_metadata(document.original_filename, pages, words_by_page)
 
     existing = db.scalar(select(AccessionRecord).where(AccessionRecord.document_id == document.id))
+
+    resolved_number = accession_number or metadata.accession_number
+    if resolved_number and not existing:
+        taken_by = db.scalar(
+            select(AccessionRecord).where(
+                AccessionRecord.accession_number == resolved_number,
+                AccessionRecord.document_id != document.id,
+            )
+        )
+        if taken_by is not None:
+            # A misread digit or two documents genuinely sharing a stamped
+            # number -- never silently collide with (or overwrite) another
+            # document's row; fall back to auto-generation instead.
+            logger.warning(
+                "extracted_accession_number_already_taken", document_id=document.id,
+                accession_number=resolved_number, taken_by_document_id=taken_by.document_id,
+            )
+            metadata.notes.append(
+                f"accession_number: extracted '{resolved_number}' is already assigned to another document; generated a new one instead"
+            )
+            resolved_number = None
+
     if existing:
         record = existing
         record.book_name = metadata.book_name
@@ -73,10 +104,11 @@ def create_accession_record_for_document(
         record.total_pages = document.page_count
         record.needs_review = metadata.needs_review
         record.extraction_notes = metadata.notes_text
+        # accession_number is deliberately left untouched here.
     else:
         record = AccessionRecord(
             document_id=document.id,
-            accession_number=accession_number or generate_next_accession_number(db),
+            accession_number=resolved_number or generate_next_accession_number(db),
             book_name=metadata.book_name,
             creator=metadata.creator,
             author=metadata.author,

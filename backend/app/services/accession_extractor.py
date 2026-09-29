@@ -14,10 +14,11 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field
 
+from app.core.config import get_settings
 from app.models.enums import LayoutBlockType
 from app.schemas.document_json import DocumentBlockJSON, PageJSON
 from app.schemas.ocr import OCRWordResult
-from app.services.cover_reader import analyze_cover
+from app.services.cover_reader import analyze_cover, page_lines_text
 
 # Government/statistical scan titles in this project's real corpus land on
 # page 1-3 (title page, sometimes a blank/publisher page in between) --
@@ -32,6 +33,14 @@ _YEAR_RE = re.compile(r"\b(1[89]\d{2}|20[0-3]\d)\b(?:\s*[-–]\s*(\d{2,4}))?")
 
 _LANGUAGE_LABELS = {"en": "ENGLISH", "hi": "HINDI", "num": "NUMERICAL"}
 
+# A stamped/printed accession number: "ACC.NO. D-1087", "ACC NO-1087",
+# "ACCESSION NO: 1087", etc. Checked against the FILENAME first (this
+# project's real corpus consistently names files
+# "<TITLE>..._ACC_NO_<N>.pdf" or similar, which is far more reliable than
+# OCR of a small, sometimes faint/skewed library stamp), then against the
+# cover's own OCR text as a fallback.
+_ACCESSION_TOKEN_RE = re.compile(r"ACC(?:ESSION)?[._\s-]*NO\.?[._\s:-]*([A-Za-z]?[-\s]?\d{2,6})", re.IGNORECASE)
+
 
 @dataclass
 class ExtractedMetadata:
@@ -40,6 +49,7 @@ class ExtractedMetadata:
     publisher: str | None
     language: str | None
     year_of_publication: str | None
+    accession_number: str | None = None
     needs_review: bool = False
     notes: list[str] = field(default_factory=list)
 
@@ -106,10 +116,48 @@ def extract_book_metadata(
         needs_review = True
         notes.append("language: not enough OCR text to classify")
 
+    accession_number = _extract_accession_number(original_filename, title_pages, words_by_page)
+    if accession_number is None:
+        # Not flagged for review -- an auto-generated sequential number is
+        # an accepted, expected fallback here, not a data-quality problem;
+        # this note just makes that traceable after the fact.
+        notes.append("accession_number: not found in the filename or on the cover; auto-generated sequentially")
+
     return ExtractedMetadata(
         book_name=book_name, author=author, publisher=publisher, language=language, year_of_publication=year,
-        needs_review=needs_review, notes=notes,
+        accession_number=accession_number, needs_review=needs_review, notes=notes,
     )
+
+
+def _extract_accession_number(original_filename: str, title_pages: list[PageJSON], words_by_page: dict[int, list[OCRWordResult]] | None) -> str | None:
+    prefix = get_settings().accession_number_prefix
+
+    match = _ACCESSION_TOKEN_RE.search(original_filename)
+    if match:
+        normalized = _normalize_accession_match(match.group(1), prefix)
+        if normalized:
+            return normalized
+
+    combined = " ".join(page_lines_text(title_pages, words_by_page))
+    match = _ACCESSION_TOKEN_RE.search(combined)
+    if match:
+        return _normalize_accession_match(match.group(1), prefix)
+
+    return None
+
+
+def _normalize_accession_match(raw: str, default_prefix: str) -> str | None:
+    """"D-1087" / "D1087" -> "D-1087" (already has its own prefix letter);
+    "1087" -> "{default_prefix}-1087" (bare number, needs the register's
+    configured prefix)."""
+    raw = raw.strip().upper().replace(" ", "")
+    match = re.match(r"^([A-Z]+)-?(\d+)$", raw)
+    if match:
+        return f"{match.group(1)}-{match.group(2)}"
+    match = re.match(r"^(\d+)$", raw)
+    if match:
+        return f"{default_prefix}-{match.group(1)}"
+    return None
 
 
 def _block_text(block: DocumentBlockJSON) -> str:

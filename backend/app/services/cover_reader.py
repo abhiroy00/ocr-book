@@ -416,3 +416,19 @@ def analyze_cover(title_pages: list[PageJSON], words_by_page: dict[int, list[OCR
         publisher=publisher,
         year=_find_year(lines, title_end, page_height),
     )
+
+
+def page_lines_text(title_pages: list[PageJSON], words_by_page: dict[int, list[OCRWordResult]] | None = None) -> list[str]:
+    """Reconstructed text lines (reading order, within each page) for
+    every one of `title_pages` -- the same line-building `analyze_cover`
+    uses, exposed for callers that need to search cover text for
+    something narrower than title/author/publisher/year (e.g. a stamped
+    "ACC.NO. D-1087" accession number, which can land anywhere on the
+    page, not necessarily near the title)."""
+    lines_text: list[str] = []
+    for page in title_pages:
+        boxes = _page_boxes(page, (words_by_page or {}).get(page.page_number))
+        if not boxes:
+            continue
+        lines_text.extend(ln.text for ln in _build_lines(boxes))
+    return lines_text
