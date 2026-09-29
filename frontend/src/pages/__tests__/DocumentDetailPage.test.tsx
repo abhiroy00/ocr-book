@@ -88,4 +88,13 @@ describe("DocumentDetailPage retry", () => {
     await new Promise((r) => setTimeout(r, 300));
     expect(vi.mocked(documentsApi.progress).mock.calls.length).toBe(1);
   });
+
+  it("shows the job's persisted stage and percent before any live event arrives", async () => {
+    vi.mocked(documentsApi.get).mockResolvedValue(doc("OCR_PROCESSING") as never);
+    vi.mocked(documentsApi.progress).mockResolvedValue({ ...job("OCR_PROCESSING"), finished_at: null, processing_duration_seconds: null } as never);
+    renderPage();
+
+    expect(await screen.findByText("65%")).toBeTruthy();
+    expect(screen.queryByText("0%")).toBeNull();
+  });
 });

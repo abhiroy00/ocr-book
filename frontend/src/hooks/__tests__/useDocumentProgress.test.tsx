@@ -126,6 +126,27 @@ describe("useDocumentProgress", () => {
     expect(progress).toHaveBeenCalledTimes(3);
     expect(result.current?.status).toBe("FAILED");
   });
+
+  it("falls back to polling when an open socket stays silent, and stops once it delivers again", async () => {
+    vi.useFakeTimers();
+    const progress = vi.spyOn(documentsApi, "progress").mockResolvedValue(job("OCR_PROCESSING"));
+    const { result } = renderHook(() => useDocumentProgress("doc-8", true));
+
+    await act(() => vi.advanceTimersByTimeAsync(9_000));
+    expect(progress).not.toHaveBeenCalled();
+
+    await act(() => vi.advanceTimersByTimeAsync(3_000));
+    expect(progress).toHaveBeenCalledTimes(1);
+    expect(result.current?.percent).toBe(50);
+
+    act(() =>
+      MockWebSocket.instances[0].emit({ document_id: "doc-8", job_id: "job-1", stage: "ocr", percent: 70, page: 5, message: "", status: "OCR_PROCESSING" }),
+    );
+    const callsAfterFrame = progress.mock.calls.length;
+    await act(() => vi.advanceTimersByTimeAsync(8_000));
+    expect(progress.mock.calls.length).toBe(callsAfterFrame);
+    expect(result.current?.percent).toBe(70);
+  });
 });
 
 function job(status: string): ProcessingJob {

@@ -120,8 +120,11 @@ export default function DocumentDetailPage() {
     return <div className="text-slate-400 text-sm">Loading…</div>;
   }
 
-  const currentStage = progressEvent?.stage ?? "upload";
-  const currentPercent = progressEvent?.percent ?? (document.status === "COMPLETED" ? 100 : 0);
+  // Before the first live event (e.g. right after opening/refreshing the
+  // page mid-run), show the job's last persisted stage/percent -- not
+  // "Uploading 0%" for a document that's hundreds of pages into OCR.
+  const currentStage = progressEvent?.stage ?? job?.stage ?? "upload";
+  const currentPercent = progressEvent?.percent ?? job?.progress_percent ?? (document.status === "COMPLETED" ? 100 : 0);
 
   return (
     <div className="space-y-6">

@@ -7,6 +7,9 @@ import type { ProgressEvent } from "@/types/document";
 // WebSocket / never stopped its polling fallback, both left running for
 // the rest of the component's lifetime.
 const TERMINAL_STATUSES = new Set(["COMPLETED", "FAILED", "CANCELLED"]);
+// The pipeline publishes after every page, so a healthy socket is rarely
+// quiet this long outside the slower post-OCR stages.
+const SOCKET_SILENCE_MS = 10_000;
 
 /**
  * Live processing progress (spec section 20): prefers the WebSocket
@@ -21,6 +24,11 @@ const TERMINAL_STATUSES = new Set(["COMPLETED", "FAILED", "CANCELLED"]);
  * hitting `/progress` every 2s, even after leaving the page, forever if
  * that request 404'd. A 4xx is also final: the document/job isn't there, and
  * asking again every 2s can't change that.
+ *
+ * A socket that opens but never delivers anything (seen in production: the
+ * page list advanced to 282/420 while the bar sat at "Uploading 0%") fires
+ * neither `error` nor `close`, so it also counts as down once it has been
+ * silent for SOCKET_SILENCE_MS: polling covers until the next frame arrives.
  */
 export function useDocumentProgress(documentId: string | undefined, enabled: boolean) {
   const [event, setEvent] = useState<ProgressEvent | null>(null);
@@ -31,6 +39,14 @@ export function useDocumentProgress(documentId: string | undefined, enabled: boo
     let finished = false;
     let socket: WebSocket | null = null;
     let poll: ReturnType<typeof setInterval> | null = null;
+    let silence: ReturnType<typeof setTimeout> | null = null;
+
+    const clearSilenceTimer = () => {
+      if (silence) {
+        clearTimeout(silence);
+        silence = null;
+      }
+    };
 
     const stopPolling = () => {
       if (poll) {
@@ -57,6 +73,7 @@ export function useDocumentProgress(documentId: string | undefined, enabled: boo
           if (TERMINAL_STATUSES.has(job.status)) {
             finished = true;
             stopPolling();
+            clearSilenceTimer();
           }
         } catch (err) {
           const status = axios.isAxiosError(err) ? err.response?.status : undefined;
@@ -69,16 +86,27 @@ export function useDocumentProgress(documentId: string | undefined, enabled: boo
       }, 2000);
     };
 
+    const armSilenceTimer = () => {
+      clearSilenceTimer();
+      if (!cancelled && !finished) silence = setTimeout(startPolling, SOCKET_SILENCE_MS);
+    };
+
     try {
       socket = new WebSocket(wsUrlForDocument(documentId));
+      armSilenceTimer();
       socket.onmessage = (msg) => {
         if (cancelled) return;
         try {
           const parsed = JSON.parse(msg.data) as ProgressEvent;
           setEvent(parsed);
+          // The socket is delivering again: it's the live source, not polling.
+          stopPolling();
           if (TERMINAL_STATUSES.has(parsed.status)) {
             finished = true;
+            clearSilenceTimer();
             socket?.close();
+          } else {
+            armSilenceTimer();
           }
         } catch {
           /* ignore malformed frame */
@@ -92,6 +120,7 @@ export function useDocumentProgress(documentId: string | undefined, enabled: boo
 
     return () => {
       cancelled = true;
+      clearSilenceTimer();
       socket?.close();
       stopPolling();
     };
