@@ -254,63 +254,93 @@ def _run_pipeline(
     total_pages = document.page_count or 1
     all_page_numbers = list(range(1, total_pages + 1))
 
-    num_workers = min(settings.resolved_ocr_workers, total_pages)
-    if max_ocr_workers:  # batch only: share the host's worker budget across concurrent documents
-        num_workers = max(1, min(num_workers, max_ocr_workers))
-    logger.info(
-        "pipeline_parallel_start", document_id=document.id, total_pages=total_pages, ocr_workers=num_workers,
-        **settings.ocr_worker_sizing_debug,
-    )
-
-    # Controlled worker-pool parallelism (spec: bounded pool, never one
-    # process per page). Each pool worker independently renders, cleans,
-    # OCRs, and layout/table-detects its own pages and writes its own
-    # image files to storage -- only small, picklable per-page results
-    # (words/tables/blocks, not raw images) travel back over the result
-    # queue, keeping peak memory roughly `num_workers` pages' worth of
-    # image buffers, never the whole document.
-    pool = PageWorkerPool(resolved_provider_name, document.id, original_bytes, is_pdf, job.dpi, profile, num_workers)
-
     words_by_page: dict[int, list] = {}
     processed_path_by_page: dict[int, str] = {}
     page_json_by_page = {}
     received_pages: set[int] = set()
 
+    # Resume support: `task_acks_late=True` means ANY reason a worker
+    # process/container goes away mid-task (a redeploy recreating the
+    # worker container, an OOM kill, a host reboot -- not hypothetical,
+    # confirmed against a real 420-page job interrupted by a container
+    # recreate) gets this whole task redelivered from the top. Without
+    # this, a redelivery reprocessed every page from scratch, discarding
+    # however many hours of already-completed OCR/layout/table work were
+    # sitting in the DB -- observed firsthand: a document restarted at
+    # stage=render/5% despite all 420 of its pages already showing
+    # `ocr_status=completed`. A page's `DocumentPage.document_json` is only
+    # ever set at the very end of `persist_page_pipeline_result`'s single
+    # transaction (everything before it -- OCR/layout/table rows -- commits
+    # together with it, never separately), so "document_json is set" is a
+    # reliable "this page is fully done" signal to skip re-submitting.
+    already_done, resumed_words, resumed_paths = _already_completed_pages(db, document)
+    if already_done:
+        logger.info(
+            "pipeline_resuming_from_prior_run", document_id=document.id,
+            already_done=len(already_done), remaining=total_pages - len(already_done),
+        )
+        words_by_page.update(resumed_words)
+        processed_path_by_page.update(resumed_paths)
+        received_pages.update(already_done)
+        document_service.update_job_progress(
+            db, job, ProcessingStage.OCR, 10, DocumentStatus.OCR_PROCESSING,
+            message=f"Resuming: {len(already_done)}/{total_pages} pages already done",
+        )
+
+    pages_to_process = [n for n in all_page_numbers if n not in already_done]
+
     page_progress_base = 10
     page_progress_span = 55  # 10..65% covers the parallel OCR/layout/table phase across pages
 
     cancelled = False
-    try:
-        pool.submit(all_page_numbers)
-        for result in pool.results(total_pages):
-            if result.error and not result.processed_path:
-                # Worker reported a page-level failure directly (not a
-                # crash -- it already tried its own Tesseract fallback
-                # first). Leave it out of `received_pages` so the
-                # sequential sweep below retries it once more rather than
-                # silently losing the page.
-                logger.warning("pipeline_page_worker_error", document_id=document.id, page=result.page_number, error=result.error)
-                continue
+    if pages_to_process:
+        num_workers = min(settings.resolved_ocr_workers, len(pages_to_process))
+        if max_ocr_workers:  # batch only: share the host's worker budget across concurrent documents
+            num_workers = max(1, min(num_workers, max_ocr_workers))
+        logger.info(
+            "pipeline_parallel_start", document_id=document.id, total_pages=total_pages,
+            pages_to_process=len(pages_to_process), ocr_workers=num_workers, **settings.ocr_worker_sizing_debug,
+        )
 
-            _persist_page_result(db, document, result)
-            words_by_page[result.page_number] = result.words
-            processed_path_by_page[result.page_number] = result.processed_path
-            received_pages.add(result.page_number)
+        # Controlled worker-pool parallelism (spec: bounded pool, never one
+        # process per page). Each pool worker independently renders, cleans,
+        # OCRs, and layout/table-detects its own pages and writes its own
+        # image files to storage -- only small, picklable per-page results
+        # (words/tables/blocks, not raw images) travel back over the result
+        # queue, keeping peak memory roughly `num_workers` pages' worth of
+        # image buffers, never the whole document.
+        pool = PageWorkerPool(resolved_provider_name, document.id, original_bytes, is_pdf, job.dpi, profile, num_workers)
+        try:
+            pool.submit(pages_to_process)
+            for result in pool.results(len(pages_to_process)):
+                if result.error and not result.processed_path:
+                    # Worker reported a page-level failure directly (not a
+                    # crash -- it already tried its own Tesseract fallback
+                    # first). Leave it out of `received_pages` so the
+                    # sequential sweep below retries it once more rather than
+                    # silently losing the page.
+                    logger.warning("pipeline_page_worker_error", document_id=document.id, page=result.page_number, error=result.error)
+                    continue
 
-            processed_count = len(received_pages)
-            percent = page_progress_base + int(page_progress_span * processed_count / max(1, total_pages))
-            document_service.update_job_progress(
-                db, job, ProcessingStage.OCR, percent, DocumentStatus.OCR_PROCESSING,
-                page=result.page_number, message=f"Processed {processed_count}/{total_pages} pages ({pool.alive_count()} workers active)",
-            )
-            _renew_document_lock(document.id, lock_token)
+                _persist_page_result(db, document, result)
+                words_by_page[result.page_number] = result.words
+                processed_path_by_page[result.page_number] = result.processed_path
+                received_pages.add(result.page_number)
 
-            if _is_cancel_requested(document.id):
-                logger.info("pipeline_cancel_requested", document_id=document.id, stage="ocr", pages_done=len(received_pages))
-                cancelled = True
-                break
-    finally:
-        pool.shutdown()
+                processed_count = len(received_pages)
+                percent = page_progress_base + int(page_progress_span * processed_count / max(1, total_pages))
+                document_service.update_job_progress(
+                    db, job, ProcessingStage.OCR, percent, DocumentStatus.OCR_PROCESSING,
+                    page=result.page_number, message=f"Processed {processed_count}/{total_pages} pages ({pool.alive_count()} workers active)",
+                )
+                _renew_document_lock(document.id, lock_token)
+
+                if _is_cancel_requested(document.id):
+                    logger.info("pipeline_cancel_requested", document_id=document.id, stage="ocr", pages_done=len(received_pages))
+                    cancelled = True
+                    break
+        finally:
+            pool.shutdown()
 
     if cancelled:
         _clear_cancel_flag(document.id)
@@ -407,6 +437,36 @@ def _run_pipeline(
         logger.error("master_register_append_failed", document_id=document.id, error=str(exc))
 
     return False
+
+
+def _already_completed_pages(db, document: Document) -> tuple[set[int], dict[int, list], dict[int, str]]:
+    """Pages left over from a PRIOR, interrupted run of this same document
+    that already have OCR+layout+table data fully persisted (see the
+    resume-support comment in `_run_pipeline`). Returns (their page
+    numbers, their OCR words keyed by page number, their processed-image
+    storage paths keyed by page number) -- exactly the shape the rest of
+    `_run_pipeline` needs to treat them as if this run had just produced
+    them, without re-touching OCR/layout/table detection at all."""
+    from app.models.document_page import DocumentPage
+    from sqlalchemy import select
+
+    pages = db.scalars(
+        select(DocumentPage).where(DocumentPage.document_id == document.id, DocumentPage.document_json.is_not(None))
+    ).all()
+    if not pages:
+        return set(), {}, {}
+
+    words_by_page_id = document_service.get_ocr_words_by_page_for_document(db, document.id)
+    done_numbers: set[int] = set()
+    words_by_page: dict[int, list] = {}
+    processed_path_by_page: dict[int, str] = {}
+    for page in pages:
+        if not page.processed_image_path:
+            continue  # shouldn't happen alongside a set document_json, but never treat a page as "done" without its image
+        done_numbers.add(page.page_number)
+        words_by_page[page.page_number] = words_by_page_id.get(page.id, [])
+        processed_path_by_page[page.page_number] = page.processed_image_path
+    return done_numbers, words_by_page, processed_path_by_page
 
 
 def _persist_page_result(db, document: Document, result: PageWorkResult) -> None:
