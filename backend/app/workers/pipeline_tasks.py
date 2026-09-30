@@ -391,7 +391,7 @@ def _run_pipeline(
         del processed_image
 
     document_service.update_job_progress(db, job, ProcessingStage.RECONSTRUCT, 75, DocumentStatus.RECONSTRUCTING, message="Rendering reconstructed PDF")
-    reconstructed_bytes = pdf_renderer.render_document_pdf(all_page_jsons)
+    reconstructed_bytes = pdf_renderer.render_document_pdf(all_page_jsons, preserve_original=True)
 
     document_service.update_job_progress(db, job, ProcessingStage.EXPORT, 85, DocumentStatus.EXPORTING, message="Exporting PDF/DOCX/Excel")
     clean_bytes = clean_doc.tobytes(deflate=True, garbage=4)
@@ -528,7 +528,13 @@ def _run_sequential_fallback(
                 # rendered rotated within its own crop, with black wedge
                 # corners where the rotation didn't fill the rectangle.
                 layout_results = layout_detector.detect(processed_image, processed_image, words, tables, rendered.width, rendered.height)
-                _crop_and_attach_graphic_images(storage, document.id, page_number, processed_image, layout_results)
+                # Graphics are cropped from the raw full-colour scan only when
+                # preprocessing left its geometry untouched (no rotate/deskew/
+                # border crop), so the processed-frame bboxes still line up.
+                _crop_and_attach_graphic_images(
+                    storage, document.id, page_number, rendered.image, processed_image, layout_results,
+                    geometry_unchanged=_geometry_unchanged(preproc, rendered.image, processed_image),
+                )
 
                 result = PageWorkResult(
                     page_number=page_number, width=rendered.width, height=rendered.height, dpi=rendered.dpi,
@@ -585,15 +591,28 @@ def _detect_tables_safely(image, words, width, height):
         return []
 
 
-def _crop_and_attach_graphic_images(storage, document_id: str, page_number: int, image, layout_results) -> None:
+def _geometry_unchanged(preproc, original_image, processed_image) -> bool:
+    return (
+        preproc.rotation_applied_deg == 0.0
+        and preproc.skew_angle_deg == 0.0
+        and original_image.shape[:2] == processed_image.shape[:2]
+    )
+
+
+def _crop_and_attach_graphic_images(
+    storage, document_id: str, page_number: int, original_image, processed_image, layout_results, geometry_unchanged: bool = False
+) -> None:
+    # `layout_results` bboxes are in `processed_image`'s frame; the raw scan
+    # is only a valid crop source when that frame matches it exactly.
+    source_image = original_image if geometry_unchanged else processed_image
     for i, result in enumerate(layout_results):
         if result.block_type not in _GRAPHIC_TYPES:
             continue
         x1, y1 = max(0, int(result.bbox.x1)), max(0, int(result.bbox.y1))
-        x2, y2 = min(image.shape[1], int(result.bbox.x2)), min(image.shape[0], int(result.bbox.y2))
+        x2, y2 = min(source_image.shape[1], int(result.bbox.x2)), min(source_image.shape[0], int(result.bbox.y2))
         if x2 <= x1 or y2 <= y1:
             continue
-        crop = image[y1:y2, x1:x2]
+        crop = source_image[y1:y2, x1:x2]
         rel_path = f"processed/{document_id}/page_{page_number:04d}_block_{i:04d}.png"
         storage.write(rel_path, _encode_png(crop))
         result.image_ref = rel_path

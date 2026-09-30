@@ -102,6 +102,11 @@ class Settings(BaseSettings):
     # --- Workers ---
     celery_worker_concurrency: int = 4
 
+    # --- Page size / reconstruction ---
+    # Preserve original page dimensions by default (do NOT force A4 by default).
+    # Set to False to normalize all output pages to A4 (optional mode).
+    preserve_original_page_size: bool = True
+
     # --- Page-level OCR parallelism (controlled worker pool, not one
     # process per page -- see app.workers.page_worker_pool) ---
     # 0 means "pick a sensible default from CPU count at pipeline start"

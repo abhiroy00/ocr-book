@@ -161,6 +161,9 @@ def compute_page_transform(
 
     # Determine portrait vs landscape based on content aspect ratio
     # Landscape only if content is significantly wider than tall
+    # (a common side-effect of a loose content bbox) should stay portrait --
+    # genuinely landscape content (a wide statistical table, a fold-out map)
+    # clears this by a wide margin.
     is_landscape = content_w_pt > content_h_pt * 1.3
 
     a4_width_pt, a4_height_pt = A4_LANDSCAPE_PT if is_landscape else A4_PORTRAIT_PT
@@ -169,19 +172,12 @@ def compute_page_transform(
     available_w = a4_width_pt - 2 * _MIN_MARGIN_PT
     available_h = a4_height_pt - 2 * _MIN_MARGIN_PT
 
-    # Scale content to fill available A4 area (always scale up, no cap)
-    # Width determines scale if landscape, height determines if portrait
-    if is_landscape:
-        scale = available_w / max(content_w_pt, 1.0)
-    else:
-        scale = available_h / max(content_h_pt, 1.0)
-
-    # Also scale the other dimension to check
-    scaled_other = content_w_pt * scale if is_landscape else content_h_pt * scale
-    if is_landscape and scaled_other > available_h * 0.95:
-        scale = available_h / max(scaled_other, 1.0)
-    elif not is_landscape and scaled_w > available_w * 0.95:
-        scale = available_w / max(content_w_pt, 1.0)
+    # Scale content to fill the available A4 area (always scale up, no cap)
+    # while preserving aspect ratio: the tighter of the two dimensions wins,
+    # so neither width nor height ever overflows the margins. (This replaced
+    # a width/height check that referenced an undefined `scaled_w` and
+    # crashed every portrait page with a NameError.)
+    scale = min(available_w / max(content_w_pt, 1.0), available_h / max(content_h_pt, 1.0))
 
     # Compute offsets to center content
     offset_x = (a4_width_pt - content_w_pt * scale) / 2
