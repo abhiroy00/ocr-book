@@ -25,6 +25,19 @@ services:
       timeout: 5s
       retries: 10
 
+  # API layer -- scaled behind the nginx load balancer. The `nginx` service
+  # (and, in production, the frontend image's nginx) resolves the `backend`
+  # DNS name to EVERY replica's IP and round-robins requests across them
+  # (nginx `proxy_pass http://$backend_upstream` with a resolver does this
+  # automatically when a name has several A records). The app is stateless
+  # across replicas by design: documents/jobs live in shared Postgres,
+  # files in the shared `storage_data` volume, and live progress is relayed
+  # over shared Redis pub/sub, so any replica can serve any request.
+  # Deliberately NO published host port -- a fixed host port maps to exactly
+  # one container and would make `--scale`/`deploy.replicas` fail with
+  # "port is already allocated". Reach the API and /docs through nginx.
+  # Tune replica count with BACKEND_REPLICAS in .env, or
+  # `docker compose up -d --scale backend=N`.
   backend:
     build:
       context: .
@@ -40,15 +53,18 @@ services:
       - ./backend:/app/backend
       - storage_data:/app/storage
       - paddleocr_models:/root/.paddleocr
-    ports:
-      - "${BACKEND_HOST_PORT:-8000}:8000"
+    deploy:
+      replicas: ${BACKEND_REPLICAS:-2}
     depends_on:
       postgres:
         condition: service_healthy
       redis:
         condition: service_healthy
+    # `migrate_with_lock.py` (not bare `alembic upgrade head`) because every
+    # replica runs this on startup and a Postgres advisory lock serialises
+    # the migration across them -- see backend/scripts/migrate_with_lock.py.
     command: >
-      sh -c "alembic upgrade head && uvicorn main:app --host 0.0.0.0 --port 8000 --reload"
+      sh -c "python scripts/migrate_with_lock.py && uvicorn main:app --host 0.0.0.0 --port 8000 --reload"
 
   worker:
     build:

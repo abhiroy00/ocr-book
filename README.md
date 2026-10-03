@@ -19,8 +19,13 @@ SCANNED DOCUMENT → IMAGE CLEANING → OCR → LAYOUT DETECTION → TABLE DETEC
                          └──────────┬──────────┘
                                     │ REST + WS
                          ┌──────────▼──────────┐
-                         │      FastAPI          │  Auth-ready API, job orchestration
-                         │  (Pydantic, SQLAlchemy)│
+                         │  nginx (load balancer)│  round-robins /api /ws /docs
+                         │  BACKEND_REPLICAS     │  across all API replicas,
+                         └──────────┬──────────┘  retries a failed one
+                                    │ REST + WS
+                         ┌──────────▼──────────┐
+                         │  FastAPI (N replicas) │  Auth-ready API, job orchestration
+                         │  (Pydantic, SQLAlchemy)│  stateless: shared DB/storage/Redis
                          └──────────┬──────────┘
                      enqueue job    │        read status/results
                          ┌──────────▼──────────┐        ┌──────────────┐
@@ -49,6 +54,16 @@ SCANNED DOCUMENT → IMAGE CLEANING → OCR → LAYOUT DETECTION → TABLE DETEC
       │ → 9 Quality validation (SSIM / pixel-diff original vs recon)      │
       └─────────────────────────────────────────────────────────────────┘
 ```
+
+The FastAPI API runs as **N identical replicas behind an nginx load
+balancer** (`BACKEND_REPLICAS`, default 2; see `docker/nginx/nginx.conf` for
+local dev and `docker/frontend/nginx.prod.conf` for production). nginx
+resolves the `backend` service name to every replica and round-robins
+requests across them, retrying another replica if one is down. Replicas are
+stateless: documents/jobs live in shared Postgres, files in the shared
+storage volume, and live progress is relayed over Redis pub/sub — so any
+replica can serve any request. Migrations are serialized across replicas by
+a Postgres advisory lock (`backend/scripts/migrate_with_lock.py`).
 
 Storage is a pluggable `StorageBackend` (local filesystem in dev, S3-compatible
 in production) so nothing in the pipeline talks to the filesystem directly.
@@ -97,7 +112,9 @@ cp .env.example .env
 bash backend/scripts/fetch_fonts.sh   # once — see script header for why this is separate from the Dockerfile
 docker compose up -d --build
 # frontend:  http://localhost:5173  (or http://localhost via nginx)
-# API docs:  http://localhost:8000/docs
+# API docs:  http://localhost/docs   (through the nginx load balancer; the API
+#            replicas no longer publish a host port so they can be scaled)
+# scale API replicas: docker compose up -d --scale backend=4
 ```
 
 ### Local development (no Docker)
@@ -139,11 +156,18 @@ See [.env.example](.env.example). Key ones:
 ## 5. Docker commands
 
 ```bash
-docker compose up -d --build     # start everything
-docker compose logs -f worker    # tail pipeline logs
+docker compose up -d --build         # start everything (2 backend replicas by default)
+docker compose up -d --scale backend=4   # scale API replicas behind the load balancer
+docker compose logs -f worker        # tail pipeline logs
 docker compose exec backend alembic upgrade head
-docker compose down -v           # stop + wipe volumes
+docker compose down -v               # stop + wipe volumes
 ```
+
+> When replicas > 1, `docker compose exec backend ...` picks one replica;
+> use `docker compose exec --index=2 backend ...` to target a specific one.
+> Migrations never need to be run by hand there — every replica runs
+> `scripts/migrate_with_lock.py` on startup, serialized by a Postgres
+> advisory lock, so `docker compose up` always brings the schema to head.
 
 ## 6. OCR setup
 

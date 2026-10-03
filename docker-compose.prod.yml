@@ -49,12 +49,23 @@ services:
     volumes:
       - storage_data:/app/storage
       - paddleocr_models:/root/.paddleocr
+    # API replicas behind the frontend image's nginx load balancer (see
+    # docker/frontend/nginx.prod.conf): that nginx resolves `backend` to
+    # every replica and round-robins requests across them, retrying on
+    # another replica if one is down. Stateless across replicas by design
+    # (shared Postgres + storage volume + Redis pub/sub for live progress).
+    # Raise BACKEND_REPLICAS in .env for more concurrency.
+    deploy:
+      replicas: ${BACKEND_REPLICAS:-2}
     depends_on:
       postgres:
         condition: service_healthy
       redis:
         condition: service_healthy
-    command: sh -c "alembic upgrade head && uvicorn main:app --host 0.0.0.0 --port 8000"
+    # `migrate_with_lock.py` serialises migrations across the replicas with a
+    # Postgres advisory lock (see backend/scripts/migrate_with_lock.py),
+    # instead of every replica racing to run bare `alembic upgrade head`.
+    command: sh -c "python scripts/migrate_with_lock.py && uvicorn main:app --host 0.0.0.0 --port 8000"
     # No --reload (that's a dev-only convenience) and no host port
     # published -- the frontend image's nginx (see docker/frontend/
     # nginx.prod.conf) is the only thing reverse-proxying to it.
