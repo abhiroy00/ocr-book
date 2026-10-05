@@ -27,7 +27,6 @@ from app.db.session import SessionLocal
 from app.models.enums import DocumentStatus, ProcessingStage
 from app.models.ocr_batch import TERMINAL_ITEM_STATES, BatchItemState, OCRBatch, OCRBatchItem
 from app.models.processing_job import ProcessingJob
-from app.ocr.factory import get_ocr_provider
 from app.services import batch_scheduler, batch_service, document_service
 from app.services.batch_scheduler import Claim, ClaimOutcome
 from app.workers.pipeline_tasks import run_document_pipeline
@@ -38,19 +37,7 @@ CLAIM_RETRY_SECONDS = 20
 _TERMINAL_VALUES = {s.value for s in TERMINAL_ITEM_STATES}
 
 
-def _effective_provider(requested: str) -> str:
-    """The engine that will REALLY run (requested -> paddleocr -> tesseract,
-    same fallback chain as the pipeline), so a batch that asks for an
-    unavailable NVIDIA/Ollama is admitted as the heavy Paddle job it will
-    actually become, not as a cheap remote-API job. PaddleOCR itself is not
-    probed: that would import the whole paddle runtime just to decide a
-    limit, and assuming Paddle is also the conservative choice."""
-    if requested == "paddleocr":
-        return requested
-    try:
-        return get_ocr_provider(requested).name
-    except Exception:  # noqa: BLE001 - no engine at all: the pipeline will fail the file clearly; be conservative here
-        return "paddleocr"
+_effective_provider = batch_scheduler.effective_provider
 
 
 def _claim(batch_id: str, task_id: str | None) -> tuple[ClaimOutcome, Claim | None]:
