@@ -187,6 +187,18 @@ class Settings(BaseSettings):
     # PDF bytes + a few page buffers). Paddle uses OCR_WORKER_EST_MEMORY_MB
     # instead. Estimate; verify on your own host before relying on it.
     batch_light_engine_est_memory_mb: int = 700
+    # Identifies the OCR worker MACHINE (not container) this process runs
+    # on. Empty (default) = single-host deployment: the concurrency limit
+    # counts every running document, exactly as before. When OCR workers
+    # run on several EC2 instances (e.g. an Auto Scaling Group), set this
+    # to something unique per machine (the EC2 instance id is ideal) so
+    # each machine admits work against its own RAM/CPU instead of being
+    # blocked by documents running on a different machine. All worker
+    # containers on the same machine must share the same value.
+    ocr_node_id: str = ""
+    # How long a single-file job that found the host at its concurrency
+    # limit waits before checking again (it stays QUEUED meanwhile).
+    ocr_admission_retry_seconds: int = 20
     # Raised from 20 -- a real use case in this project's corpus is
     # uploading 60-70 books in one batch; they still process one-by-one
     # (bounded by resolved_ocr_workers/concurrency slots below, never all

@@ -16,6 +16,7 @@ rather than failing the entire document (spec section 29).
 from __future__ import annotations
 
 import os
+import random
 import uuid
 
 import cv2
@@ -24,7 +25,7 @@ from celery.signals import task_failure
 
 from app.core.celery_app import celery_app
 from app.core.config import get_settings
-from app.core.locks import DOCUMENT_CANCEL_PREFIX, DOCUMENT_LOCK_PREFIX
+from app.core.locks import DOCUMENT_CANCEL_PREFIX, DOCUMENT_LOCK_PREFIX, lock_value_for_node
 from app.core.logging import get_logger, stage_timer
 from app.db.session import SessionLocal
 from app.layout.detector import LayoutDetector
@@ -74,7 +75,7 @@ def _acquire_document_lock(document_id: str) -> str | None:
     original). Self-heals via TTL if a holder dies without releasing it."""
     settings = get_settings()
     client = redis.Redis.from_url(settings.redis_url)
-    token = uuid.uuid4().hex
+    token = lock_value_for_node(settings.ocr_node_id, uuid.uuid4().hex)
     try:
         acquired = client.set(DOCUMENT_LOCK_PREFIX + document_id, token, nx=True, ex=_DOCUMENT_LOCK_TTL_SECONDS)
         return token if acquired else None
@@ -138,19 +139,35 @@ def _release_document_lock(document_id: str, token: str) -> None:
         client.close()
 
 
-@celery_app.task(bind=True, name="pipeline.process_document")
+NO_CAPACITY = "no_capacity"
+
+
+@celery_app.task(bind=True, name="pipeline.process_document", max_retries=None)
 def process_document(self, document_id: str, job_id: str) -> str:
-    return run_document_pipeline(self.request.id, document_id, job_id)
+    outcome = run_document_pipeline(self.request.id, document_id, job_id, admission_check=True)
+    if outcome == NO_CAPACITY:
+        # Same id, re-queued with a delay: the job stays QUEUED (visible as
+        # waiting, cancellable via revoke) instead of overloading the host.
+        # Jittered: two tasks that took their locks at the same instant
+        # both see "over the limit" and back off; without jitter they would
+        # keep retrying in lockstep and keep colliding.
+        base = get_settings().ocr_admission_retry_seconds
+        raise self.retry(countdown=base + random.uniform(0, base))
+    return outcome
 
 
-def run_document_pipeline(task_id: str | None, document_id: str, job_id: str, max_ocr_workers: int | None = None) -> str:
+def run_document_pipeline(
+    task_id: str | None, document_id: str, job_id: str, max_ocr_workers: int | None = None, *, admission_check: bool = False
+) -> str:
     """The whole single-document pipeline run, shared by the single-file
     task above and the multiple-file task (`app.workers.batch_tasks`) so a
     batched file goes through exactly the same code -- there is one OCR
-    implementation, not two. `max_ocr_workers` is `None` for a single-file
-    upload (behavior unchanged); a batch passes a cap only when several
-    documents run at once, so together they stay within the host's OCR
-    worker budget."""
+    implementation, not two. A batch passes `max_ocr_workers` (its claim
+    already went through `batch_scheduler.claim_next_item`'s admission). A
+    single-file upload passes `admission_check=True` instead: it is
+    admitted here, after taking its lock, against the same host-wide limit
+    (`batch_scheduler.admit_single_document`), and returns NO_CAPACITY
+    without touching the job if the host is full."""
     db = SessionLocal()
     storage = get_storage()
     lock_token = None
@@ -187,6 +204,21 @@ def run_document_pipeline(task_id: str | None, document_id: str, job_id: str, ma
                 error="Skipped: another processing run for this document was already active. Re-run to try again.",
             )
             return "duplicate_skipped"
+
+        if admission_check:
+            from app.services import batch_scheduler
+
+            provider = batch_scheduler.effective_provider(job.ocr_provider.value)
+            admission = batch_scheduler.admit_single_document(db, document_id, provider)
+            if not admission.admitted:
+                logger.info(
+                    "pipeline_waiting_for_capacity", document_id=document_id, job_id=job_id,
+                    in_use=admission.in_use, limit=admission.limit,
+                )
+                _release_document_lock(document_id, lock_token)
+                lock_token = None
+                return NO_CAPACITY
+            max_ocr_workers = admission.pool_cap
 
         job.celery_task_id = task_id
         db.commit()

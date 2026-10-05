@@ -14,6 +14,7 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 from sqlalchemy.orm.attributes import flag_modified
 
+from app.core.logging import get_logger
 from app.db.base import new_uuid
 from app.layout.detector import LayoutBlockResult
 from app.models.document import Document
@@ -34,6 +35,8 @@ from app.tables.models import DetectedTable
 from app.utils.file_safety import sanitize_filename, validate_upload
 
 PAGE_SIZE_DEFAULT = 20
+
+logger = get_logger(__name__)
 
 
 def compute_document_hash(content: bytes) -> str:
@@ -187,7 +190,36 @@ def create_processing_job(
     document.error_message = None
     db.commit()
     db.refresh(job)
+    clear_stale_cancel_flag(document.id)
     return job
+
+
+def clear_stale_cancel_flag(document_id: str) -> None:
+    """A new run must not inherit an old run's cancel request. `/cancel`
+    sets a 1-hour Redis flag that only a RUNNING pipeline consumes between
+    pages -- so cancelling a job that was still QUEUED (its task is revoked
+    and never runs) or already past OCR left the flag behind. Reproduced
+    (2026-10-03): cancel a queued document, retry it, and the retry
+    "cancelled by user" itself after its first page.
+
+    Only cleared when no pipeline currently holds this document's lock: if
+    one does, the flag is a live request aimed at that run, which consumes
+    and clears it itself. Best-effort -- Redis being unreachable must never
+    block creating the job."""
+    import redis as redis_sync
+
+    from app.core.config import get_settings
+    from app.core.locks import DOCUMENT_CANCEL_PREFIX, DOCUMENT_LOCK_PREFIX
+
+    try:
+        client = redis_sync.Redis.from_url(get_settings().redis_url, socket_connect_timeout=2, socket_timeout=2)
+        try:
+            if not client.exists(DOCUMENT_LOCK_PREFIX + document_id):
+                client.delete(DOCUMENT_CANCEL_PREFIX + document_id)
+        finally:
+            client.close()
+    except redis_sync.exceptions.RedisError as exc:
+        logger.warning("cancel_flag_reset_failed", document_id=document_id, error=str(exc))
 
 
 def update_job_progress(
