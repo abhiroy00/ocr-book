@@ -387,7 +387,15 @@ def _run_pipeline(
             continue  # a page the fallback sweep still couldn't recover -- already logged; skip its image-based pages
         processed_image = _decode_png(storage.read(processed_path))
         clean_pdf.add_clean_page(clean_doc, processed_image, page_json.dpi)
-        searchable_pdf.add_searchable_page(searchable_doc, processed_image, page_json.dpi, words_by_page.get(n, []), font_path)
+        words = words_by_page.get(n, [])
+        if not words:
+            # Word-level OCR rows unavailable for this page -- fall back to
+            # its Document JSON text/table blocks so it still gets a
+            # searchable text layer instead of an image-only page. No-op
+            # whenever words exist (no duplication, no visual change: the
+            # layer is invisible either way).
+            words = searchable_pdf.fallback_words_from_blocks(page_json.blocks, n)
+        searchable_pdf.add_searchable_page(searchable_doc, processed_image, page_json.dpi, words, font_path)
         del processed_image
 
     document_service.update_job_progress(db, job, ProcessingStage.RECONSTRUCT, 75, DocumentStatus.RECONSTRUCTING, message="Rendering reconstructed PDF")

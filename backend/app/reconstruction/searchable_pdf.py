@@ -21,8 +21,75 @@ import fitz  # PyMuPDF
 import numpy as np
 
 from app.reconstruction.fonts import resolve_body_font_path, resolve_devanagari_fallback_font_paths
+from app.models.enums import LayoutBlockType
+from app.schemas.document_json import DocumentBlockJSON
+from app.schemas.geometry import BBox, Polygon
 from app.schemas.ocr import OCRWordResult
 from app.utils.page_normalize import compute_page_transform
+
+
+# Block types that carry no searchable text of their own (pure graphics or
+# rule lines). Everything else with text -- paragraphs, headings, table
+# cells -- contributes to the fallback text layer below.
+_NON_TEXT_BLOCK_TYPES = frozenset({
+    LayoutBlockType.IMAGE,
+    LayoutBlockType.CHART,
+    LayoutBlockType.SIGNATURE,
+    LayoutBlockType.STAMP,
+    LayoutBlockType.HANDWRITTEN,
+    LayoutBlockType.HLINE,
+    LayoutBlockType.VLINE,
+})
+
+
+def _bbox_polygon(bbox: BBox) -> Polygon:
+    return Polygon.from_xy_list([[bbox.x1, bbox.y1], [bbox.x2, bbox.y1], [bbox.x2, bbox.y2], [bbox.x1, bbox.y2]])
+
+
+def fallback_words_from_blocks(blocks: list[DocumentBlockJSON], page_number: int) -> list[OCRWordResult]:
+    """Word-level pseudo-results from Document JSON text/table blocks, used
+    ONLY when a page's word-level OCR rows are missing. It can never
+    duplicate the primary text layer (callers use it solely when `words`
+    is empty) -- it guarantees a page with visible text is never exported
+    as an image-only, unsearchable page just because its word rows are
+    unavailable. Table cells are kept per-cell so numbers stay searchable.
+    Block bboxes are already in the processed-image pixel frame (see
+    `build_page_json`), exactly the coordinate space `add_searchable_page`
+    expects, so no conversion is needed.
+
+    Block/cell text is split into whitespace-separated tokens sharing the
+    block's bbox (position-approximate, like the rest of this invisible
+    layer) rather than inserted as one multi-word string: some fallback
+    fonts encode the space character as a non-breaking space, which would
+    silently break phrase search, while separate tokens stay searchable
+    under every font."""
+    out: list[OCRWordResult] = []
+    idx = 0
+
+    def _add(text: str, bbox: BBox, confidence: float, block_id: str, line_id: str) -> None:
+        nonlocal idx
+        for token in text.split():
+            out.append(OCRWordResult(
+                text=token, confidence=confidence, bbox=bbox,
+                polygon=_bbox_polygon(bbox), page_number=page_number,
+                block_id=f"fb_{block_id}_{idx}", line_id=line_id, language="und",
+            ))
+            idx += 1
+
+    for b in blocks:
+        if b.type in _NON_TEXT_BLOCK_TYPES:
+            continue
+        if b.type == LayoutBlockType.TABLE and b.table:
+            for row in b.table.rows:
+                for cell in row.cells:
+                    text = (cell.text or "").strip()
+                    if text:
+                        _add(text, cell.bbox, cell.confidence or 0.0, b.id, f"fb_{b.id}_r{cell.row}")
+            continue
+        text = " ".join(run.text for run in (b.content or []) if run.text and run.text.strip()).strip()
+        if text:
+            _add(text, b.bbox, b.confidence, b.id, f"fb_{b.id}")
+    return out
 
 
 def _font_covers_text(font: "fitz.Font", text: str) -> bool:

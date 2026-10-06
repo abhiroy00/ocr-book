@@ -204,3 +204,55 @@ def test_resolve_text_layer_fonts_never_empty_and_prefers_primary():
     # Distinct files get distinct PDF resource names (reusing one name
     # would silently draw the wrong font for the second file).
     assert len({name for name, _, _ in pool}) == len(pool)
+
+
+def _doc_block(block_id, block_type, x1, y1, x2, y2, text="", table=None):
+    from app.models.enums import LayoutBlockType
+    from app.schemas.document_json import DocumentBlockJSON, TextRunJSON
+    from app.schemas.geometry import NormBBox
+
+    return DocumentBlockJSON(
+        id=block_id, type=block_type, bbox=BBox(x1=x1, y1=y1, x2=x2, y2=y2),
+        bbox_norm=NormBBox(x1=0, y1=0, x2=1, y2=1), confidence=0.9, z_order=0,
+        content=[TextRunJSON(text=text)] if text else [], table=table,
+    )
+
+
+def test_fallback_words_from_blocks_makes_wordless_page_searchable():
+    """Safety net for pages whose word-level OCR rows are missing: the
+    Document JSON's own paragraph text and table-cell numbers must still
+    land in the invisible text layer (block/cell granularity), so such a
+    page never exports as image-only. Uses `font_path=None` to prove the
+    fallback works independent of the bundled fonts."""
+    from app.models.enums import LayoutBlockType, TextAlign
+    from app.reconstruction.searchable_pdf import fallback_words_from_blocks
+    from app.schemas.document_json import TableBlockJSON, TableCellJSON, TableRowJSON
+
+    table = TableBlockJSON(rows=[TableRowJSON(cells=[
+        TableCellJSON(row=0, column=0, text="45189", bbox=BBox(x1=100, y1=300, x2=250, y2=350), align_h=TextAlign.LEFT),
+    ])])
+    blocks = [
+        _doc_block("b1", LayoutBlockType.PARAGRAPH, 100, 100, 500, 150, text="WORLD DEVELOPMENT REPORT"),
+        _doc_block("b2", LayoutBlockType.TABLE, 100, 300, 500, 350, table=table),
+        _doc_block("b3", LayoutBlockType.IMAGE, 100, 500, 500, 900),
+    ]
+    words = fallback_words_from_blocks(blocks, 1)
+    assert [w.text for w in words] == ["WORLD", "DEVELOPMENT", "REPORT", "45189"]
+
+    doc = fitz.open()
+    add_searchable_page(doc, _blank_image(), 150, words, None)
+    page = doc[0]
+    for term in ("WORLD", "DEVELOPMENT", "REPORT", "45189"):
+        assert term in page.get_text(), term
+        assert len(page.search_for(term)) >= 1, term
+    assert len(page.get_images()) == 1
+
+
+def test_fallback_words_from_blocks_empty_when_no_text():
+    """No text blocks, no table cells: fallback yields nothing (same as
+    before -- a genuinely blank page stays image-only, never crashes)."""
+    from app.models.enums import LayoutBlockType
+    from app.reconstruction.searchable_pdf import fallback_words_from_blocks
+
+    assert fallback_words_from_blocks([], 1) == []
+    assert fallback_words_from_blocks([_doc_block("b9", LayoutBlockType.IMAGE, 0, 0, 100, 100)], 1) == []

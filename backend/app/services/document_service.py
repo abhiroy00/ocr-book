@@ -801,6 +801,21 @@ def rebuild_image_based_exports(db: Session, storage, document: Document) -> dic
         if image is None:
             continue
         words = words_by_page.get(page.id, [])
+        if not words and page.document_json:
+            # Same word-row safety net as the pipeline: rebuild the text
+            # layer from this page's stored Document JSON blocks so a page
+            # with visible text never regenerates as image-only. Never
+            # breaks a working rebuild -- any parse problem just keeps
+            # today's behavior (no words for this page).
+            try:
+                from app.schemas.document_json import PageJSON
+
+                if isinstance(page.document_json, dict):
+                    words = searchable_pdf.fallback_words_from_blocks(
+                        PageJSON(**page.document_json).blocks, page.page_number
+                    )
+            except Exception:  # noqa: BLE001
+                pass
         clean_pdf.add_clean_page(clean_doc, image, page.dpi)
         searchable_pdf.add_searchable_page(searchable_doc, image, page.dpi, words, font_path)
 
