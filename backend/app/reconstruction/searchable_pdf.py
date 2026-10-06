@@ -42,6 +42,26 @@ _NON_TEXT_BLOCK_TYPES = frozenset({
 })
 
 
+# Graphic (non-text) block types whose bboxes must be included in the
+# page's content crop so paintings/photos/figures are never discarded
+# from the searchable PDF's page image. Lines carry no area worth
+# preserving and are deliberately excluded.
+_GRAPHIC_BLOCK_TYPES = frozenset({
+    LayoutBlockType.IMAGE,
+    LayoutBlockType.CHART,
+    LayoutBlockType.SIGNATURE,
+    LayoutBlockType.STAMP,
+    LayoutBlockType.HANDWRITTEN,
+})
+
+
+def graphic_content_boxes(blocks: list[DocumentBlockJSON]) -> list[BBox]:
+    """BBoxes of graphic blocks on a page, in the same processed-image
+    pixel frame as OCR words. Purely additive to the content crop -- pages
+    without graphics behave exactly as before."""
+    return [b.bbox for b in blocks if b.type in _GRAPHIC_BLOCK_TYPES and b.bbox.width > 0 and b.bbox.height > 0]
+
+
 def _bbox_polygon(bbox: BBox) -> Polygon:
     return Polygon.from_xy_list([[bbox.x1, bbox.y1], [bbox.x2, bbox.y1], [bbox.x2, bbox.y2], [bbox.x1, bbox.y2]])
 
@@ -132,7 +152,14 @@ def _resolve_text_layer_fonts(primary_path: str | None) -> list[tuple[str, str |
     return fonts
 
 
-def add_searchable_page(doc: "fitz.Document", image, dpi: int, words: list[OCRWordResult], font_path: str | None) -> None:
+def add_searchable_page(
+    doc: "fitz.Document",
+    image,
+    dpi: int,
+    words: list[OCRWordResult],
+    font_path: str | None,
+    extra_content_boxes: list[BBox] | None = None,
+) -> None:
     """Appends one A4-normalized, image+invisible-text-layer page to an
     already-open fitz.Document (incremental, memory-safe for large
     documents).
@@ -156,7 +183,7 @@ def add_searchable_page(doc: "fitz.Document", image, dpi: int, words: list[OCRWo
     import cv2
 
     height_px, width_px = image.shape[:2]
-    transform = compute_page_transform(width_px, height_px, words, dpi)
+    transform = compute_page_transform(width_px, height_px, words, dpi, extra_boxes=extra_content_boxes)
     page = doc.new_page(width=transform.page_width_pt, height=transform.page_height_pt)
 
     cropped = image[transform.crop_y1 : transform.crop_y2, transform.crop_x1 : transform.crop_x2]

@@ -86,13 +86,16 @@ class PageTransform:
         )
 
 
-def compute_content_bbox(width: int, height: int, words: list[OCRWordResult], margin_px: int) -> tuple[int, int, int, int]:
-    """Union of every non-blank OCR word's bounding box, expanded by
-    `margin_px`, clamped to the page. This -- not pixel/ink analysis --
-    is the content boundary: it is built to always contain every OCR
-    word by construction, so cropping to it can never lose OCR content
-    (spec's mandatory "no content loss" safety property falls out of the
-    definition itself, not a separate check bolted on after).
+def compute_content_bbox(
+    width: int, height: int, words: list[OCRWordResult], margin_px: int, extra_boxes: list[BBox] | None = None
+) -> tuple[int, int, int, int]:
+    """Union of every non-blank OCR word's bounding box plus any extra
+    content boxes (detected graphic/painting regions, which carry no OCR
+    words of their own), expanded by `margin_px`, clamped to the page.
+    The graphic boxes are what keeps a cover painting/photo from being
+    cropped out of the searchable PDF just because the OCR text sits in a
+    small title region -- text-only pages (no graphics) behave exactly as
+    before, since there is nothing extra to union.
 
     Falls back to the full, uncropped page for a genuinely sparse page
     (near-blank, or a content region suspiciously smaller than a
@@ -101,13 +104,17 @@ def compute_content_bbox(width: int, height: int, words: list[OCRWordResult], ma
     proper book page, not a tiny cropped sliver.
     """
     real_words = [w for w in words if w.text.strip()]
-    if not real_words:
+    boxes = [w.bbox for w in real_words]
+    for b in extra_boxes or []:
+        if b.width > 0 and b.height > 0:
+            boxes.append(b)
+    if not boxes:
         return 0, 0, width, height
 
-    x1 = min(w.bbox.x1 for w in real_words)
-    y1 = min(w.bbox.y1 for w in real_words)
-    x2 = max(w.bbox.x2 for w in real_words)
-    y2 = max(w.bbox.y2 for w in real_words)
+    x1 = min(b.x1 for b in boxes)
+    y1 = min(b.y1 for b in boxes)
+    x2 = max(b.x2 for b in boxes)
+    y2 = max(b.y2 for b in boxes)
 
     x1 = max(0, int(x1 - margin_px))
     y1 = max(0, int(y1 - margin_px))
@@ -120,7 +127,9 @@ def compute_content_bbox(width: int, height: int, words: list[OCRWordResult], ma
     return x1, y1, x2, y2
 
 
-def compute_page_transform(width: int, height: int, words: list[OCRWordResult], dpi: int) -> PageTransform:
+def compute_page_transform(
+    width: int, height: int, words: list[OCRWordResult], dpi: int, extra_boxes: list[BBox] | None = None
+) -> PageTransform:
     """The single source of truth for how a page's image AND its OCR
     words both get placed on the output A4 canvas -- callers must use the
     same `PageTransform` instance for both, or the invisible text layer
@@ -130,7 +139,7 @@ def compute_page_transform(width: int, height: int, words: list[OCRWordResult], 
     # (150/200/300/400/600) -- a fixed pixel margin would be too tight at
     # high DPI and too loose at low DPI.
     margin_px = max(3, int(dpi * (2.0 / 25.4)))
-    x1, y1, x2, y2 = compute_content_bbox(width, height, words, margin_px)
+    x1, y1, x2, y2 = compute_content_bbox(width, height, words, margin_px, extra_boxes)
     content_w_px, content_h_px = x2 - x1, y2 - y1
 
     pt_per_px = 72.0 / dpi

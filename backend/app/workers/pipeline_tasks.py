@@ -395,7 +395,14 @@ def _run_pipeline(
             # whenever words exist (no duplication, no visual change: the
             # layer is invisible either way).
             words = searchable_pdf.fallback_words_from_blocks(page_json.blocks, n)
-        searchable_pdf.add_searchable_page(searchable_doc, processed_image, page_json.dpi, words, font_path)
+        # Graphic regions (paintings/photos/figures) join the content crop
+        # so they are never cut out of the page image; text-only pages are
+        # unaffected and the invisible text uses the identical transform,
+        # so search highlighting stays aligned with the visible words.
+        extra_boxes = searchable_pdf.graphic_content_boxes(page_json.blocks)
+        searchable_pdf.add_searchable_page(
+            searchable_doc, processed_image, page_json.dpi, words, font_path, extra_content_boxes=extra_boxes
+        )
         del processed_image
 
     document_service.update_job_progress(db, job, ProcessingStage.RECONSTRUCT, 75, DocumentStatus.RECONSTRUCTING, message="Rendering reconstructed PDF")

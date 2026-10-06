@@ -256,3 +256,39 @@ def test_fallback_words_from_blocks_empty_when_no_text():
 
     assert fallback_words_from_blocks([], 1) == []
     assert fallback_words_from_blocks([_doc_block("b9", LayoutBlockType.IMAGE, 0, 0, 100, 100)], 1) == []
+
+
+def test_searchable_page_graphic_painting_is_preserved_in_crop():
+    """A cover painting (graphic block, no OCR words of its own) must not
+    be cropped out of the searchable PDF just because the OCR text sits in
+    a separate column -- graphic boxes join the content boundary, so the
+    full painting stays visible and the title stays searchable. Without the
+    graphic box (the old text-only crop) the same page keeps only the text
+    column and the painting is lost."""
+    from app.models.enums import LayoutBlockType
+    from app.reconstruction.searchable_pdf import graphic_content_boxes
+
+    image = np.full((1200, 800, 3), 255, dtype=np.uint8)
+    image[300:1100, 400:750] = (0, 0, 255)  # BGR red painting, right column
+    # Two text lines far apart vertically (left column) so their union
+    # clears the sparse-content fallback and the old code crops tightly to
+    # the text column alone, discarding the right-column painting.
+    words = [_word("TITLE", 100, 60, 300, 100), _word("FOOT", 100, 1000, 300, 1040)]
+    painting = graphic_content_boxes([_doc_block("g1", LayoutBlockType.IMAGE, 400, 300, 750, 1100)])
+    assert len(painting) == 1
+
+    def _has_red_painting(extra):
+        doc = fitz.open()
+        add_searchable_page(doc, image, 150, words, None, extra_content_boxes=extra)
+        page = doc[0]
+        assert len(page.search_for("TITLE")) == 1
+        assert len(page.search_for("FOOT")) == 1
+        xref = page.get_images(full=True)[0][0]
+        pix = fitz.Pixmap(doc, xref)
+        arr = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, pix.n)
+        rgb = arr[..., :3]  # our PNG has no alpha; fitz yields RGB order
+        red = (rgb[..., 0] > 200) & (rgb[..., 1] < 50) & (rgb[..., 2] < 50)
+        return bool(red.any())
+
+    assert _has_red_painting(painting)
+    assert not _has_red_painting(None)  # old text-only crop discards the painting
