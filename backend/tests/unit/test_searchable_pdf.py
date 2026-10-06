@@ -6,7 +6,7 @@ text layer that makes the "cleaned searchable PDF" download (spec section
 import fitz
 import numpy as np
 
-from app.reconstruction.searchable_pdf import add_searchable_page
+from app.reconstruction.searchable_pdf import _font_covers_text, _resolve_text_layer_fonts, add_searchable_page
 from app.schemas.geometry import BBox, Polygon
 from app.schemas.ocr import OCRWordResult
 
@@ -139,3 +139,68 @@ def test_searchable_page_sparse_title_page_fills_the_page():
     # the placed text must land meaningfully larger than that old,
     # un-scaled size.
     assert hits[0].height > 40
+
+
+def test_searchable_page_mixed_english_number_hindi_all_searchable():
+    """The reported defect, end to end at the PDF level: a mixed Hindi/
+    English page's OCR words, numbers, and phrases must ALL be Ctrl+F-
+    searchable in the generated PDF, even when no bundled Unicode font is
+    handed in (`font_path=None`, the state of any host/image that never
+    got the fetched fonts). Regression: Hindi words used to be inserted
+    with a Latin-only font, extracting as unmapped garbage so search could
+    never find them."""
+    words = [
+        _word("Statistics", 100, 100, 300, 150),
+        _word("1989", 100, 200, 220, 250),
+        _word("\u0915\u0943\u0937\u093f", 100, 300, 220, 350),
+        _word("\u0939\u0930\u093f\u092f\u093e\u0923\u093e", 250, 300, 450, 350),
+    ]
+    doc = fitz.open()
+    add_searchable_page(doc, _blank_image(), 150, words, None)
+
+    page = doc[0]
+    text = page.get_text()
+    for term in ("Statistics", "1989", "\u0915\u0943\u0937\u093f", "\u0939\u0930\u093f\u092f\u093e\u0923\u093e"):
+        assert term in text, term
+        assert len(page.search_for(term)) >= 1, term
+    # The visible page must still be the untouched scan image (appearance
+    # unchanged): one embedded image, A4 canvas, invisible-only text.
+    assert len(page.get_images()) == 1
+
+
+def test_font_covers_text_helv_covers_latin_not_devanagari():
+    """Coverage contract the per-word font picker relies on: base-14
+    Helvetica encodes Latin/numbers but not Devanagari, so it must never
+    be picked for a Hindi word when any covering font exists. Hermetic --
+    needs no font files at all."""
+    helv = fitz.Font(fontname="helv")
+    assert _font_covers_text(helv, "Statistics 1989")
+    assert not _font_covers_text(helv, "\u0915\u0943\u0937\u093f")
+    assert not _font_covers_text(helv, "Report \u0915\u0943\u0937\u093f")
+
+
+def test_resolve_text_layer_fonts_never_empty_and_prefers_primary():
+    """The font pool always yields something usable, and the pipeline's
+    body font stays first (so fully-covered pages render exactly as
+    before) whenever it is a real, loadable file. Uses only the fonts the
+    resolver actually finds -- no hardcoded paths."""
+    from app.reconstruction.fonts import resolve_body_font_path, resolve_devanagari_fallback_font_paths
+
+    pool = _resolve_text_layer_fonts(None)
+    assert pool, "must always fall back to at least Helvetica"
+
+    primary = resolve_body_font_path()
+    fallbacks = resolve_devanagari_fallback_font_paths()
+    if primary is None and not fallbacks:
+        # No Unicode font anywhere on this machine: pool is Helvetica
+        # only, and Latin/numbers must still be searchable (guaranteed by
+        # the mixed test's Latin assertions above, not re-asserted here).
+        assert pool[0][0] == "helv"
+        return
+
+    expected_first = primary if primary else fallbacks[0]
+    pool = _resolve_text_layer_fonts(primary)
+    assert pool[0][1] == expected_first
+    # Distinct files get distinct PDF resource names (reusing one name
+    # would silently draw the wrong font for the second file).
+    assert len({name for name, _, _ in pool}) == len(pool)
