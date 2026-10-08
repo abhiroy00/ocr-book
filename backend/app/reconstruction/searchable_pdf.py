@@ -15,15 +15,151 @@ why the content boundary comes from OCR word boxes, not pixel analysis).
 """
 from __future__ import annotations
 
+import os
+
 import fitz  # PyMuPDF
 import numpy as np
 
-from app.reconstruction.fonts import resolve_body_font_path
+from app.reconstruction.fonts import resolve_body_font_path, resolve_devanagari_fallback_font_paths
+from app.models.enums import LayoutBlockType
+from app.schemas.document_json import DocumentBlockJSON
+from app.schemas.geometry import BBox, Polygon
 from app.schemas.ocr import OCRWordResult
 from app.utils.page_normalize import compute_page_transform
 
 
-def add_searchable_page(doc: "fitz.Document", image, dpi: int, words: list[OCRWordResult], font_path: str | None) -> None:
+# Block types that carry no searchable text of their own (pure graphics or
+# rule lines). Everything else with text -- paragraphs, headings, table
+# cells -- contributes to the fallback text layer below.
+_NON_TEXT_BLOCK_TYPES = frozenset({
+    LayoutBlockType.IMAGE,
+    LayoutBlockType.CHART,
+    LayoutBlockType.SIGNATURE,
+    LayoutBlockType.STAMP,
+    LayoutBlockType.HANDWRITTEN,
+    LayoutBlockType.HLINE,
+    LayoutBlockType.VLINE,
+})
+
+
+# Graphic (non-text) block types whose bboxes must be included in the
+# page's content crop so paintings/photos/figures are never discarded
+# from the searchable PDF's page image. Lines carry no area worth
+# preserving and are deliberately excluded.
+_GRAPHIC_BLOCK_TYPES = frozenset({
+    LayoutBlockType.IMAGE,
+    LayoutBlockType.CHART,
+    LayoutBlockType.SIGNATURE,
+    LayoutBlockType.STAMP,
+    LayoutBlockType.HANDWRITTEN,
+})
+
+
+def graphic_content_boxes(blocks: list[DocumentBlockJSON]) -> list[BBox]:
+    """BBoxes of graphic blocks on a page, in the same processed-image
+    pixel frame as OCR words. Purely additive to the content crop -- pages
+    without graphics behave exactly as before."""
+    return [b.bbox for b in blocks if b.type in _GRAPHIC_BLOCK_TYPES and b.bbox.width > 0 and b.bbox.height > 0]
+
+
+def _bbox_polygon(bbox: BBox) -> Polygon:
+    return Polygon.from_xy_list([[bbox.x1, bbox.y1], [bbox.x2, bbox.y1], [bbox.x2, bbox.y2], [bbox.x1, bbox.y2]])
+
+
+def fallback_words_from_blocks(blocks: list[DocumentBlockJSON], page_number: int) -> list[OCRWordResult]:
+    """Word-level pseudo-results from Document JSON text/table blocks, used
+    ONLY when a page's word-level OCR rows are missing. It can never
+    duplicate the primary text layer (callers use it solely when `words`
+    is empty) -- it guarantees a page with visible text is never exported
+    as an image-only, unsearchable page just because its word rows are
+    unavailable. Table cells are kept per-cell so numbers stay searchable.
+    Block bboxes are already in the processed-image pixel frame (see
+    `build_page_json`), exactly the coordinate space `add_searchable_page`
+    expects, so no conversion is needed.
+
+    Block/cell text is split into whitespace-separated tokens sharing the
+    block's bbox (position-approximate, like the rest of this invisible
+    layer) rather than inserted as one multi-word string: some fallback
+    fonts encode the space character as a non-breaking space, which would
+    silently break phrase search, while separate tokens stay searchable
+    under every font."""
+    out: list[OCRWordResult] = []
+    idx = 0
+
+    def _add(text: str, bbox: BBox, confidence: float, block_id: str, line_id: str) -> None:
+        nonlocal idx
+        for token in text.split():
+            out.append(OCRWordResult(
+                text=token, confidence=confidence, bbox=bbox,
+                polygon=_bbox_polygon(bbox), page_number=page_number,
+                block_id=f"fb_{block_id}_{idx}", line_id=line_id, language="und",
+            ))
+            idx += 1
+
+    for b in blocks:
+        if b.type in _NON_TEXT_BLOCK_TYPES:
+            continue
+        if b.type == LayoutBlockType.TABLE and b.table:
+            for row in b.table.rows:
+                for cell in row.cells:
+                    text = (cell.text or "").strip()
+                    if text:
+                        _add(text, cell.bbox, cell.confidence or 0.0, b.id, f"fb_{b.id}_r{cell.row}")
+            continue
+        text = " ".join(run.text for run in (b.content or []) if run.text and run.text.strip()).strip()
+        if text:
+            _add(text, b.bbox, b.confidence, b.id, f"fb_{b.id}")
+    return out
+
+
+def _font_covers_text(font: "fitz.Font", text: str) -> bool:
+    """True when `font` has a glyph for every non-space character in
+    `text`. A single bad glyph must never fail the page, so any lookup
+    error reads as "not covered" and the caller simply tries the next
+    candidate font."""
+    try:
+        return all(font.has_glyph(ord(ch)) for ch in text if not ch.isspace())
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _resolve_text_layer_fonts(primary_path: str | None) -> list[tuple[str, str | None, "fitz.Font"]]:
+    """(resource name, fontfile path or None for base-14, measuring Font)
+    for every font file usable by this page's invisible text layer, in
+    priority order: the pipeline's body font first, then the bundled/OS
+    Devanagari fallbacks. Broken files are skipped, never fatal -- worst
+    case the page falls back to plain Helvetica, exactly today's behavior
+    when no Unicode font is available.
+
+    Each distinct file gets its own resource name ("F0", "F1", ...) because
+    PyMuPDF reuses an already-registered name's *first* file and would
+    otherwise silently draw a different font than the one measured."""
+    candidates: list[str] = []
+    if primary_path and os.path.exists(primary_path):
+        candidates.append(primary_path)
+    for fallback in resolve_devanagari_fallback_font_paths():
+        if fallback not in candidates:
+            candidates.append(fallback)
+
+    fonts: list[tuple[str, str | None, "fitz.Font"]] = []
+    for i, path in enumerate(candidates):
+        try:
+            fonts.append((f"F{i}", path, fitz.Font(fontfile=path)))
+        except Exception:  # noqa: BLE001 - a corrupt font file must not fail the page
+            continue
+    if not fonts:
+        fonts.append(("helv", None, fitz.Font(fontname="helv")))
+    return fonts
+
+
+def add_searchable_page(
+    doc: "fitz.Document",
+    image,
+    dpi: int,
+    words: list[OCRWordResult],
+    font_path: str | None,
+    extra_content_boxes: list[BBox] | None = None,
+) -> None:
     """Appends one A4-normalized, image+invisible-text-layer page to an
     already-open fitz.Document (incremental, memory-safe for large
     documents).
@@ -47,7 +183,7 @@ def add_searchable_page(doc: "fitz.Document", image, dpi: int, words: list[OCRWo
     import cv2
 
     height_px, width_px = image.shape[:2]
-    transform = compute_page_transform(width_px, height_px, words, dpi)
+    transform = compute_page_transform(width_px, height_px, words, dpi, extra_boxes=extra_content_boxes)
     page = doc.new_page(width=transform.page_width_pt, height=transform.page_height_pt)
 
     cropped = image[transform.crop_y1 : transform.crop_y2, transform.crop_x1 : transform.crop_x2]
@@ -67,7 +203,21 @@ def add_searchable_page(doc: "fitz.Document", image, dpi: int, words: list[OCRWo
     # word's measured width isn't silently wrong, which would make the
     # overflow-shrink below either fire when it shouldn't or not fire when
     # it should. Loaded once per page, not per word.
-    measure_font = fitz.Font(fontfile=font_path) if font_path else fitz.Font(fontname="helv")
+    #
+    # The invisible layer is only ever searched/selected, never seen -- so
+    # the font for a word is chosen by *coverage*, not looks. The single
+    # body font is not guaranteed to encode every script on the page (it
+    # is the Latin Noto Sans whenever that file is present, and plain
+    # Helvetica -- Latin-only -- whenever the bundled fonts are absent).
+    # A Hindi/Devanagari word drawn with a font that has no Devanagari
+    # glyphs is inserted as unmapped glyphs and extracts as garbage, so
+    # Ctrl+F can never find it despite correct underlying OCR. Per word,
+    # use the first available font that actually covers every character in
+    # that word: the body font wins whenever it covers the word, so
+    # Latin/numbers (and Devanagari when the bundled variable Noto Sans,
+    # which covers both scripts, is present) render exactly as before.
+    # Visible output is byte-identical either way -- this text is invisible.
+    text_fonts = _resolve_text_layer_fonts(font_path)
 
     for w in words:
         if not w.text.strip():
@@ -80,12 +230,19 @@ def add_searchable_page(doc: "fitz.Document", image, dpi: int, words: list[OCRWo
         x1 = transformed.x1
         y2 = transformed.y2  # baseline approximated at the box bottom
         fontsize = max(3.0, box_height * 0.85)
+        fontname, fontfile, measure_font = text_fonts[0]
+        if not _font_covers_text(measure_font, w.text):
+            # The primary font cannot encode this word -- try the
+            # Devanagari fallbacks before giving up and drawing it with an
+            # unsuitable font (which is what made such words unsearchable).
+            for candidate in text_fonts[1:]:
+                if _font_covers_text(candidate[2], w.text):
+                    fontname, fontfile, measure_font = candidate
+                    break
         kwargs = {"fontsize": fontsize, "render_mode": 3, "color": (0, 0, 0)}  # render_mode 3 = invisible
-        if font_path:
-            kwargs["fontfile"] = font_path
-            kwargs["fontname"] = "F0"
-        else:
-            kwargs["fontname"] = "helv"
+        kwargs["fontname"] = fontname
+        if fontfile:
+            kwargs["fontfile"] = fontfile
         try:
             # insert_text draws at nominal fontsize with no box constraint,
             # so a long word in a narrow box can overshoot noticeably --

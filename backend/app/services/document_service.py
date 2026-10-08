@@ -833,8 +833,23 @@ def rebuild_image_based_exports(db: Session, storage, document: Document) -> dic
         if image is None:
             continue
         words = words_by_page.get(page.id, [])
+        extra_boxes: list = []
+        if page.document_json and isinstance(page.document_json, dict):
+            # Stored Document JSON for this page, when parseable: supplies
+            # the word-row safety net below AND the graphic regions that
+            # must stay inside the page-image crop. Never breaks a working
+            # rebuild -- any parse problem just keeps today's behavior.
+            try:
+                from app.schemas.document_json import PageJSON
+
+                page_blocks = PageJSON(**page.document_json).blocks
+                if not words:
+                    words = searchable_pdf.fallback_words_from_blocks(page_blocks, page.page_number)
+                extra_boxes = searchable_pdf.graphic_content_boxes(page_blocks)
+            except Exception:  # noqa: BLE001
+                pass
         clean_pdf.add_clean_page(clean_doc, image, page.dpi)
-        searchable_pdf.add_searchable_page(searchable_doc, image, page.dpi, words, font_path)
+        searchable_pdf.add_searchable_page(searchable_doc, image, page.dpi, words, font_path, extra_content_boxes=extra_boxes)
 
     clean_bytes = clean_doc.tobytes(deflate=True, garbage=4)
     clean_doc.close()

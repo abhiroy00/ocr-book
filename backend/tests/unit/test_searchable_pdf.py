@@ -6,7 +6,7 @@ text layer that makes the "cleaned searchable PDF" download (spec section
 import fitz
 import numpy as np
 
-from app.reconstruction.searchable_pdf import add_searchable_page
+from app.reconstruction.searchable_pdf import _font_covers_text, _resolve_text_layer_fonts, add_searchable_page
 from app.schemas.geometry import BBox, Polygon
 from app.schemas.ocr import OCRWordResult
 
@@ -139,3 +139,156 @@ def test_searchable_page_sparse_title_page_fills_the_page():
     # the placed text must land meaningfully larger than that old,
     # un-scaled size.
     assert hits[0].height > 40
+
+
+def test_searchable_page_mixed_english_number_hindi_all_searchable():
+    """The reported defect, end to end at the PDF level: a mixed Hindi/
+    English page's OCR words, numbers, and phrases must ALL be Ctrl+F-
+    searchable in the generated PDF, even when no bundled Unicode font is
+    handed in (`font_path=None`, the state of any host/image that never
+    got the fetched fonts). Regression: Hindi words used to be inserted
+    with a Latin-only font, extracting as unmapped garbage so search could
+    never find them."""
+    words = [
+        _word("Statistics", 100, 100, 300, 150),
+        _word("1989", 100, 200, 220, 250),
+        _word("\u0915\u0943\u0937\u093f", 100, 300, 220, 350),
+        _word("\u0939\u0930\u093f\u092f\u093e\u0923\u093e", 250, 300, 450, 350),
+    ]
+    doc = fitz.open()
+    add_searchable_page(doc, _blank_image(), 150, words, None)
+
+    page = doc[0]
+    text = page.get_text()
+    for term in ("Statistics", "1989", "\u0915\u0943\u0937\u093f", "\u0939\u0930\u093f\u092f\u093e\u0923\u093e"):
+        assert term in text, term
+        assert len(page.search_for(term)) >= 1, term
+    # The visible page must still be the untouched scan image (appearance
+    # unchanged): one embedded image, A4 canvas, invisible-only text.
+    assert len(page.get_images()) == 1
+
+
+def test_font_covers_text_helv_covers_latin_not_devanagari():
+    """Coverage contract the per-word font picker relies on: base-14
+    Helvetica encodes Latin/numbers but not Devanagari, so it must never
+    be picked for a Hindi word when any covering font exists. Hermetic --
+    needs no font files at all."""
+    helv = fitz.Font(fontname="helv")
+    assert _font_covers_text(helv, "Statistics 1989")
+    assert not _font_covers_text(helv, "\u0915\u0943\u0937\u093f")
+    assert not _font_covers_text(helv, "Report \u0915\u0943\u0937\u093f")
+
+
+def test_resolve_text_layer_fonts_never_empty_and_prefers_primary():
+    """The font pool always yields something usable, and the pipeline's
+    body font stays first (so fully-covered pages render exactly as
+    before) whenever it is a real, loadable file. Uses only the fonts the
+    resolver actually finds -- no hardcoded paths."""
+    from app.reconstruction.fonts import resolve_body_font_path, resolve_devanagari_fallback_font_paths
+
+    pool = _resolve_text_layer_fonts(None)
+    assert pool, "must always fall back to at least Helvetica"
+
+    primary = resolve_body_font_path()
+    fallbacks = resolve_devanagari_fallback_font_paths()
+    if primary is None and not fallbacks:
+        # No Unicode font anywhere on this machine: pool is Helvetica
+        # only, and Latin/numbers must still be searchable (guaranteed by
+        # the mixed test's Latin assertions above, not re-asserted here).
+        assert pool[0][0] == "helv"
+        return
+
+    expected_first = primary if primary else fallbacks[0]
+    pool = _resolve_text_layer_fonts(primary)
+    assert pool[0][1] == expected_first
+    # Distinct files get distinct PDF resource names (reusing one name
+    # would silently draw the wrong font for the second file).
+    assert len({name for name, _, _ in pool}) == len(pool)
+
+
+def _doc_block(block_id, block_type, x1, y1, x2, y2, text="", table=None):
+    from app.models.enums import LayoutBlockType
+    from app.schemas.document_json import DocumentBlockJSON, TextRunJSON
+    from app.schemas.geometry import NormBBox
+
+    return DocumentBlockJSON(
+        id=block_id, type=block_type, bbox=BBox(x1=x1, y1=y1, x2=x2, y2=y2),
+        bbox_norm=NormBBox(x1=0, y1=0, x2=1, y2=1), confidence=0.9, z_order=0,
+        content=[TextRunJSON(text=text)] if text else [], table=table,
+    )
+
+
+def test_fallback_words_from_blocks_makes_wordless_page_searchable():
+    """Safety net for pages whose word-level OCR rows are missing: the
+    Document JSON's own paragraph text and table-cell numbers must still
+    land in the invisible text layer (block/cell granularity), so such a
+    page never exports as image-only. Uses `font_path=None` to prove the
+    fallback works independent of the bundled fonts."""
+    from app.models.enums import LayoutBlockType, TextAlign
+    from app.reconstruction.searchable_pdf import fallback_words_from_blocks
+    from app.schemas.document_json import TableBlockJSON, TableCellJSON, TableRowJSON
+
+    table = TableBlockJSON(rows=[TableRowJSON(cells=[
+        TableCellJSON(row=0, column=0, text="45189", bbox=BBox(x1=100, y1=300, x2=250, y2=350), align_h=TextAlign.LEFT),
+    ])])
+    blocks = [
+        _doc_block("b1", LayoutBlockType.PARAGRAPH, 100, 100, 500, 150, text="WORLD DEVELOPMENT REPORT"),
+        _doc_block("b2", LayoutBlockType.TABLE, 100, 300, 500, 350, table=table),
+        _doc_block("b3", LayoutBlockType.IMAGE, 100, 500, 500, 900),
+    ]
+    words = fallback_words_from_blocks(blocks, 1)
+    assert [w.text for w in words] == ["WORLD", "DEVELOPMENT", "REPORT", "45189"]
+
+    doc = fitz.open()
+    add_searchable_page(doc, _blank_image(), 150, words, None)
+    page = doc[0]
+    for term in ("WORLD", "DEVELOPMENT", "REPORT", "45189"):
+        assert term in page.get_text(), term
+        assert len(page.search_for(term)) >= 1, term
+    assert len(page.get_images()) == 1
+
+
+def test_fallback_words_from_blocks_empty_when_no_text():
+    """No text blocks, no table cells: fallback yields nothing (same as
+    before -- a genuinely blank page stays image-only, never crashes)."""
+    from app.models.enums import LayoutBlockType
+    from app.reconstruction.searchable_pdf import fallback_words_from_blocks
+
+    assert fallback_words_from_blocks([], 1) == []
+    assert fallback_words_from_blocks([_doc_block("b9", LayoutBlockType.IMAGE, 0, 0, 100, 100)], 1) == []
+
+
+def test_searchable_page_graphic_painting_is_preserved_in_crop():
+    """A cover painting (graphic block, no OCR words of its own) must not
+    be cropped out of the searchable PDF just because the OCR text sits in
+    a separate column -- graphic boxes join the content boundary, so the
+    full painting stays visible and the title stays searchable. Without the
+    graphic box (the old text-only crop) the same page keeps only the text
+    column and the painting is lost."""
+    from app.models.enums import LayoutBlockType
+    from app.reconstruction.searchable_pdf import graphic_content_boxes
+
+    image = np.full((1200, 800, 3), 255, dtype=np.uint8)
+    image[300:1100, 400:750] = (0, 0, 255)  # BGR red painting, right column
+    # Two text lines far apart vertically (left column) so their union
+    # clears the sparse-content fallback and the old code crops tightly to
+    # the text column alone, discarding the right-column painting.
+    words = [_word("TITLE", 100, 60, 300, 100), _word("FOOT", 100, 1000, 300, 1040)]
+    painting = graphic_content_boxes([_doc_block("g1", LayoutBlockType.IMAGE, 400, 300, 750, 1100)])
+    assert len(painting) == 1
+
+    def _has_red_painting(extra):
+        doc = fitz.open()
+        add_searchable_page(doc, image, 150, words, None, extra_content_boxes=extra)
+        page = doc[0]
+        assert len(page.search_for("TITLE")) == 1
+        assert len(page.search_for("FOOT")) == 1
+        xref = page.get_images(full=True)[0][0]
+        pix = fitz.Pixmap(doc, xref)
+        arr = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, pix.n)
+        rgb = arr[..., :3]  # our PNG has no alpha; fitz yields RGB order
+        red = (rgb[..., 0] > 200) & (rgb[..., 1] < 50) & (rgb[..., 2] < 50)
+        return bool(red.any())
+
+    assert _has_red_painting(painting)
+    assert not _has_red_painting(None)  # old text-only crop discards the painting
