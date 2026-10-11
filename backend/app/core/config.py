@@ -144,7 +144,11 @@ class Settings(BaseSettings):
     # a different PADDLE_OCR_LANGS configuration changes the real
     # per-worker footprint on your host -- and prefer a longer measurement
     # (10+ pages) over a short one: early pages undercount the true cost.
-    ocr_worker_est_memory_mb: int = 4800
+    # Re-measured 2026-10-09 on a real 402-page scanned book (150 DPI,
+    # en+hi): ~7.5GB from the second page on, then flat (peak 7538MB over
+    # 15 pages). The 4800 above came from synthetic pages; on real scans it
+    # let two documents run at once on a 12GB host and the host OOMed.
+    ocr_worker_est_memory_mb: int = 7600
     # False bypasses the RAM-aware calculation below entirely and honors
     # OCR_WORKERS literally -- an explicit escape hatch for an operator
     # who has already sized their own host. The default (True) is what
@@ -163,6 +167,15 @@ class Settings(BaseSettings):
     # for hours, infrequent enough that the model-reload cost on respawn
     # (a few seconds) stays a small fraction of total time.
     ocr_worker_max_pages: int = 25
+    # Memory ceiling (MB of RSS) for one page worker: once crossed after a
+    # page, the worker exits cleanly and the pool starts a fresh one (model
+    # reload costs seconds). 0 disables it. See `OCR_WORKER_MAX_RSS_MB` in
+    # .env.example for how the default was measured.
+    ocr_worker_max_rss_mb: int = 9000
+    # A page worker still on the SAME page after this long is treated as
+    # hung: killed, replaced, and the page retried once. Generous on
+    # purpose -- a normal page takes ~25-70s (first page also loads models).
+    ocr_page_timeout_seconds: int = 900
     # Independent, much smaller concurrency cap for NVIDIA AI-fallback
     # calls specifically -- normal OCR parallelism (OCR_WORKERS) must not
     # translate into that many simultaneous external API requests.

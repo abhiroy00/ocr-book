@@ -344,7 +344,7 @@ def _run_pipeline(
         pool = PageWorkerPool(resolved_provider_name, document.id, original_bytes, is_pdf, job.dpi, profile, num_workers)
         try:
             pool.submit(pages_to_process)
-            for result in pool.results(len(pages_to_process)):
+            for result in pool.results(len(pages_to_process), heartbeat=lambda: _renew_document_lock(document.id, lock_token)):
                 if result.error and not result.processed_path:
                     # Worker reported a page-level failure directly (not a
                     # crash -- it already tried its own Tesseract fallback
@@ -548,10 +548,20 @@ def _run_sequential_fallback(
     Returns True if a `/cancel` request was seen partway through."""
     layout_detector = LayoutDetector()
     ocr_worker = IsolatedOCRWorker(provider_name)
+    # One crash of the primary-engine subprocess used to switch EVERY
+    # remaining page to Tesseract for good (2026-10-08: ~160 pages of a
+    # 402-page book silently came out of Tesseract). Restart the primary
+    # engine a few times first; Tesseract stays the per-page last resort.
+    engine_restarts_left = 3
     try:
         for page_number in missing_pages:
             if _is_cancel_requested(document.id):
                 return True
+            if not ocr_worker.alive and engine_restarts_left > 0:
+                engine_restarts_left -= 1
+                logger.warning("pipeline_fallback_restarting_ocr_engine", document_id=document.id, page=page_number, restarts_left=engine_restarts_left)
+                ocr_worker.shutdown()
+                ocr_worker = IsolatedOCRWorker(provider_name)
             try:
                 rendered = render_single_page(original_bytes, is_pdf, page_number, dpi)
                 original_path = f"pages/{document.id}/page_{page_number:04d}_original.png"

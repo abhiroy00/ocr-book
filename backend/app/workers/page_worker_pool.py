@@ -27,7 +27,7 @@ Workers each open their own `fitz.Document` handle from the same inherited
 source-PDF bytes (safe -- see `pdf_ingest.render_single_page`) and write
 their own per-page image/crop files directly to storage; only small,
 picklable structured results (words/tables/layout blocks, not raw images)
-travel back over the result queue. This keeps peak memory bounded to
+travel back over each worker's pipe. This keeps peak memory bounded to
 roughly `OCR_WORKERS` pages' worth of image buffers at any instant, never
 the whole document (spec requirement).
 
@@ -40,12 +40,13 @@ or even one dead worker, never takes down the whole document.
 """
 from __future__ import annotations
 
-import queue
 import time
+from collections import deque
 from dataclasses import dataclass, field
-from typing import Iterator
+from typing import Callable, Iterator
 
 import billiard as mp
+import billiard.connection as mp_connection
 
 from app.core.config import get_settings
 from app.core.logging import get_logger
@@ -57,8 +58,6 @@ from app.vision.preprocessor import PreprocessProfile
 
 logger = get_logger(__name__)
 
-_RESULT_TIMEOUT_SECONDS = 180
-_FIRST_RESULT_TIMEOUT_SECONDS = 300  # first page per worker also pays one-time model load/download cost
 
 _GRAPHIC_TYPES = {
     LayoutBlockType.IMAGE,
@@ -89,6 +88,34 @@ class PageWorkResult:
     worker_name: str = ""
     processing_time: float = 0.0
     error: str | None = None
+    # Set on the LAST result a worker sends before it exits on purpose
+    # (page quota or memory ceiling reached) -- the parent replaces it.
+    worker_exiting: bool = False
+
+
+def _make_oom_preferred_victim() -> None:
+    """Ask the Linux OOM killer to pick THIS page worker first when memory
+    runs out. Without it the kernel picked whichever process was biggest
+    or unluckiest -- including the Celery process that owns the whole
+    document job -- and the document stalled with no way to recover
+    (2026-10-08: a 402-page book ended up "Processing stalled" after an
+    OOM). A killed page worker is recoverable: the pool re-queues its page
+    and starts a fresh worker. Raising one's own score needs no privilege;
+    silently skipped where /proc is unavailable (Windows/macOS dev)."""
+    try:
+        with open("/proc/self/oom_score_adj", "w") as f:
+            f.write("1000")
+    except OSError:
+        pass
+
+
+def _rss_mb() -> float:
+    try:
+        import psutil
+
+        return psutil.Process().memory_info().rss / (1024 * 1024)
+    except Exception:  # noqa: BLE001 - telemetry only; never fail a page over it
+        return 0.0
 
 
 def _child_main(
@@ -99,12 +126,12 @@ def _child_main(
     is_pdf: bool,
     dpi: int,
     profile_value: str,
-    task_q: "mp.Queue",
-    result_q: "mp.Queue",
+    conn,
     max_pages: int,
+    max_rss_mb: int = 0,
 ) -> None:
     """Pool worker entry point. Loads the OCR engine and layout detector
-    once, then serves page numbers off `task_q` until it receives the
+    once, then serves page numbers the parent sends over `conn` until it receives the
     shutdown sentinel (None) OR has processed `max_pages` pages, whichever
     comes first -- at which point it exits cleanly and `PageWorkerPool`
     replaces it with a fresh process at the same slot (see `results()`).
@@ -124,6 +151,8 @@ def _child_main(
     crash takes the process down, which the parent observes via
     `is_alive()`."""
     import os
+
+    _make_oom_preferred_victim()
 
     # Must happen before numpy/cv2/paddle are imported -- OpenMP/MKL/
     # OpenBLAS read these once at library-load time, not per-call, so
@@ -168,7 +197,7 @@ def _child_main(
     try:
         provider = get_ocr_provider(provider_name)
     except Exception as exc:  # noqa: BLE001
-        result_q.put(PageWorkResult(page_number=-1, error=f"provider init failed: {exc}"))
+        conn.send(PageWorkResult(page_number=-1, worker_name=worker_name, error=f"provider init failed: {exc}"))
         return
 
     storage = get_storage()
@@ -177,12 +206,16 @@ def _child_main(
 
     pages_done = 0
     while True:
-        page_number = task_q.get()
+        try:
+            page_number = conn.recv()
+        except EOFError:
+            return  # parent went away
         if page_number is None:  # sentinel: shut down
             return
 
         start = time.perf_counter()
         log.info("page_worker_processing", worker=worker_name, page=page_number)
+        result: PageWorkResult
         try:
             rendered = render_single_page(file_bytes, is_pdf, page_number, dpi)
 
@@ -236,31 +269,46 @@ def _child_main(
             log.info(
                 "page_worker_completed", worker=worker_name, page=page_number,
                 words=len(words), tables=len(tables), duration=round(time.perf_counter() - start, 2),
+                rss_mb=round(_rss_mb()),
             )
-            result_q.put(
-                PageWorkResult(
-                    page_number=page_number,
-                    width=rendered.width,
-                    height=rendered.height,
-                    dpi=rendered.dpi,
-                    rotation=rendered.rotation,
-                    original_path=original_path,
-                    processed_path=processed_path,
-                    words=words,
-                    tables=tables,
-                    layout_results=layout_results,
-                    ocr_provider_used=provider.name,
-                    worker_name=worker_name,
-                    processing_time=time.perf_counter() - start,
-                )
+            result = PageWorkResult(
+                page_number=page_number,
+                width=rendered.width,
+                height=rendered.height,
+                dpi=rendered.dpi,
+                rotation=rendered.rotation,
+                original_path=original_path,
+                processed_path=processed_path,
+                words=words,
+                tables=tables,
+                layout_results=layout_results,
+                ocr_provider_used=provider.name,
+                worker_name=worker_name,
+                processing_time=time.perf_counter() - start,
             )
         except Exception as exc:  # noqa: BLE001 - a page-level failure must never kill this worker process
             log.error("page_worker_page_failed", page=page_number, error=str(exc))
-            result_q.put(PageWorkResult(page_number=page_number, processing_time=time.perf_counter() - start, error=str(exc)))
+            result = PageWorkResult(
+                page_number=page_number, worker_name=worker_name, processing_time=time.perf_counter() - start, error=str(exc)
+            )
 
         pages_done += 1
+        # Recycle on page quota OR memory ceiling, whichever comes first.
+        # The quota alone was not enough: measured 2026-10-08, one PaddleOCR
+        # worker reached 8.3GB after only 14 pages of a real scanned book --
+        # far below the 25-page quota -- and with two documents running the
+        # host OOMed. The RSS ceiling bounds each worker's memory directly,
+        # however fast a particular book makes it grow.
+        rss = _rss_mb()
+        reason = None
         if pages_done >= max_pages:
-            log.info("page_worker_recycling", worker=worker_name, pages_done=pages_done)
+            reason = "page_quota"
+        elif max_rss_mb and rss >= max_rss_mb:
+            reason = "memory_ceiling"
+        result.worker_exiting = reason is not None
+        conn.send(result)
+        if reason:
+            log.info("page_worker_recycling", worker=worker_name, pages_done=pages_done, reason=reason, rss_mb=round(rss))
             return  # clean exit -- PageWorkerPool.results() spawns a replacement at this slot
 
 
@@ -305,7 +353,30 @@ class PageWorkerPool:
     processes. Submit page numbers, then drain results (which may arrive
     out of page-number order -- callers must sort by `page_number` before
     building anything that depends on document order, e.g. the final PDF/
-    DOCX; per-page DB persistence does not need to)."""
+    DOCX; per-page DB persistence does not need to).
+
+    Each worker has its OWN duplex pipe, and the parent hands out one page
+    at a time to an idle worker. This replaced a shared task queue + shared
+    result queue after a real 402-page book stalled (2026-10-08): workers
+    killed by the OOM killer took their page with them (nothing knew which
+    page they held), and a process killed while holding a shared queue's
+    internal lock can block every other worker forever. With per-worker
+    pipes the parent always knows exactly which page each worker holds, and
+    no lock is shared between processes.
+
+    Self-healing:
+      * a worker that DIES mid-page (OOM kill, native crash) is replaced and
+        the page it held is retried -- up to `_MAX_PAGE_ATTEMPTS` per page;
+      * a worker that HANGS on one page past `page_timeout_seconds` is
+        killed and handled the same way (one previously stalled a document
+        for 40 minutes while still counting as "alive");
+      * a worker that exits on purpose (page quota / memory ceiling) is
+        replaced without losing anything.
+    Only a page that keeps killing workers comes back as an error result,
+    which the pipeline's sequential sweep then retries one last time."""
+
+    _MAX_PAGE_ATTEMPTS = 2
+    _POLL_SECONDS = 5
 
     def __init__(
         self,
@@ -317,112 +388,196 @@ class PageWorkerPool:
         profile: PreprocessProfile,
         num_workers: int,
         max_pages_per_worker: int | None = None,
+        max_rss_mb: int | None = None,
+        page_timeout_seconds: int | None = None,
     ) -> None:
         self.num_workers = max(1, num_workers)
         # Confirmed by direct measurement (2026-09-14) that a single
-        # worker's memory grows unbounded over a long document (8GB after
-        # 68 pages, vs. ~4.5GB after 10 in a short benchmark), degrading
-        # per-page time roughly 10x alongside it -- see `_child_main`'s
-        # docstring. Recycling each worker after this many pages resets
-        # that growth periodically instead of letting a large (100+ page)
+        # worker's memory grows over a long document; recycling each worker
+        # after this many pages (or once it crosses the memory ceiling)
+        # resets that growth periodically instead of letting a large
         # document compound it for hours.
         settings = get_settings()
         self.max_pages_per_worker = max_pages_per_worker or settings.ocr_worker_max_pages
+        self.max_rss_mb = settings.ocr_worker_max_rss_mb if max_rss_mb is None else max_rss_mb
+        self.page_timeout_seconds = page_timeout_seconds or settings.ocr_page_timeout_seconds
         self._provider_name = provider_name
         self._document_id = document_id
         self._file_bytes = file_bytes
         self._is_pdf = is_pdf
         self._dpi = dpi
         self._profile = profile
-        self._task_q: "mp.Queue" = mp.Queue()
-        self._result_q: "mp.Queue" = mp.Queue()
-        self._procs: list[mp.Process] = []
-        self._pages_done_by_worker: dict[str, int] = {}
-        self._first_result_pending = True
-        # `in_flight` tracks which page each still-alive worker is currently
-        # holding, so a crashed worker's page can be identified and retried
-        # rather than silently vanishing (section 18: one page's failure
-        # must not lose that page's content without at least one fallback
-        # attempt).
-        self._in_flight: dict[int, int] = {}  # worker index -> page_number
+        self._procs: list = [None] * self.num_workers
+        self._conns: list = [None] * self.num_workers
+        self._names: list[str] = [""] * self.num_workers  # "" = slot abandoned
+        self._generation = 0
+        # Unplanned replacements (crash/hang) allowed for the whole pool, so
+        # a page that reliably kills every worker cannot respawn forever.
+        self._crash_respawns_left = max(3, 2 * self.num_workers)
+        self._pending: deque[int] = deque()
+        self._in_flight: dict[int, tuple[int, float]] = {}  # slot -> (page_number, dispatched monotonic)
+        self._attempts: dict[int, int] = {}
 
         for i in range(self.num_workers):
-            self._procs.append(self._spawn_worker(i))
+            self._spawn_worker(i)
 
     def _spawn_worker(self, index: int) -> "mp.Process":
-        worker_name = f"pw-{index}"
-        self._pages_done_by_worker[worker_name] = 0
+        self._generation += 1
+        worker_name = f"pw-{index}.{self._generation}"
+        parent_conn, child_conn = mp.Pipe(duplex=True)
         proc = mp.Process(
             target=_child_main,
             args=(
                 worker_name, self._provider_name, self._document_id, self._file_bytes, self._is_pdf,
-                self._dpi, self._profile.value, self._task_q, self._result_q, self.max_pages_per_worker,
+                self._dpi, self._profile.value, child_conn, self.max_pages_per_worker, self.max_rss_mb,
             ),
             daemon=True,
         )
         proc.start()
+        child_conn.close()  # the parent keeps only its own end, so EOF is seen when the child dies
+        self._procs[index] = proc
+        self._conns[index] = parent_conn
+        self._names[index] = worker_name
         return proc
 
     def submit(self, page_numbers: list[int]) -> None:
         for n in page_numbers:
-            self._task_q.put(n)
+            self._attempts.setdefault(n, 0)
+            self._pending.append(n)
+        self._dispatch()
 
-    def results(self, expected_count: int) -> Iterator[PageWorkResult]:
-        """Yields one `PageWorkResult` per submitted page (in completion
-        order, NOT page-number order) until `expected_count` results have
-        been produced or every worker has died.
-
-        A worker that exits cleanly after hitting `max_pages_per_worker`
-        (not a crash -- see `_child_main`) is replaced with a fresh
-        process at the same slot so pool-level parallelism is maintained
-        for the rest of the document; there is always still more work
-        queued at that point since `submit()` puts every page up front."""
-        received = 0
-        while received < expected_count:
-            if not any(p.is_alive() for p in self._procs):
-                logger.error("page_worker_pool_all_workers_dead", received=received, expected=expected_count)
+    def _dispatch(self) -> None:
+        for slot in range(self.num_workers):
+            if not self._pending:
                 return
-            timeout = _FIRST_RESULT_TIMEOUT_SECONDS if self._first_result_pending else _RESULT_TIMEOUT_SECONDS
+            if not self._names[slot] or slot in self._in_flight or not self._procs[slot].is_alive():
+                continue
+            page_number = self._pending.popleft()
             try:
-                result = self._result_q.get(timeout=timeout)
-            except queue.Empty:
-                logger.error("page_worker_pool_result_timeout", received=received, expected=expected_count)
-                continue  # a still-alive worker may just be slow on a big page; loop re-checks liveness above
-            self._first_result_pending = False
-            received += 1
-            yield result
+                self._conns[slot].send(page_number)
+                self._in_flight[slot] = (page_number, time.monotonic())
+            except (OSError, EOFError, BrokenPipeError):
+                self._pending.appendleft(page_number)  # worker just died; the health check handles it
 
-            if received >= expected_count:
-                break  # no more work coming -- nothing left to respawn a worker for
+    def _retire(self, index: int, kill: bool) -> None:
+        proc = self._procs[index]
+        if kill and proc.is_alive():
+            proc.terminate()
+        proc.join(10)
+        if proc.is_alive():
+            proc.kill()
+            proc.join(5)
+        try:
+            self._conns[index].close()
+        except OSError:
+            pass
 
-            worker_name = result.worker_name
-            if not worker_name or worker_name not in self._pages_done_by_worker:
-                continue
-            self._pages_done_by_worker[worker_name] += 1
-            if self._pages_done_by_worker[worker_name] < self.max_pages_per_worker:
-                continue
+    def _handle_lost_worker(self, index: int, why: str) -> PageWorkResult | None:
+        """A worker died or hung. Retry (or give up on) the page it held,
+        and replace the worker while the crash budget lasts. Returns an
+        error result when that page has now used up its attempts."""
+        self._retire(index, kill=True)
+        lost = self._in_flight.pop(index, None)
+        given_up: PageWorkResult | None = None
+        if lost is not None:
+            page_number = lost[0]
+            self._attempts[page_number] = self._attempts.get(page_number, 0) + 1
+            if self._attempts[page_number] < self._MAX_PAGE_ATTEMPTS:
+                logger.warning("page_worker_lost_page_requeued", worker=self._names[index], page=page_number, reason=why)
+                self._pending.appendleft(page_number)
+            else:
+                logger.error("page_worker_page_gave_up", worker=self._names[index], page=page_number, reason=why)
+                given_up = PageWorkResult(
+                    page_number=page_number, error=f"page worker {why} on this page {self._attempts[page_number]} times"
+                )
+        if self._crash_respawns_left > 0:
+            self._crash_respawns_left -= 1
+            logger.warning("page_worker_replaced", worker=self._names[index], reason=why, respawns_left=self._crash_respawns_left)
+            self._spawn_worker(index)
+        else:
+            logger.error("page_worker_not_replaced_budget_exhausted", worker=self._names[index], reason=why)
+            self._names[index] = ""
+        return given_up
 
-            index = int(worker_name.rsplit("-", 1)[-1])
-            old_proc = self._procs[index]
-            old_proc.join(30)  # the child exits right after this result -- should be near-instant
-            if old_proc.is_alive():
-                logger.warning("page_worker_recycle_did_not_exit_in_time", worker=worker_name)
-                old_proc.terminate()
-                old_proc.join(5)
-            logger.info("page_worker_pool_respawning", worker=worker_name, pages_done=self._pages_done_by_worker[worker_name])
-            self._procs[index] = self._spawn_worker(index)
+    def results(self, expected_count: int, heartbeat: Callable[[], None] | None = None) -> Iterator[PageWorkResult]:
+        """Yields exactly one `PageWorkResult` per submitted page (in
+        completion order, NOT page-number order) until `expected_count`
+        distinct pages are accounted for, or no worker can be kept alive.
+
+        `heartbeat` is called at least every `_POLL_SECONDS` while waiting,
+        so the caller can keep its document lock alive even while a single
+        page is very slow -- renewing only after each finished page let the
+        lock expire under memory pressure, and the job was then wrongly
+        reported as "Processing stalled" while it was still running."""
+        done: set[int] = set()
+        last_beat = 0.0
+        while len(done) < expected_count:
+            now = time.monotonic()
+            if heartbeat is not None and now - last_beat >= self._POLL_SECONDS:
+                last_beat = now
+                try:
+                    heartbeat()
+                except Exception as exc:  # noqa: BLE001 - a heartbeat problem must not stop page processing
+                    logger.warning("page_worker_pool_heartbeat_failed", error=str(exc))
+
+            self._dispatch()
+            live = {self._conns[i]: i for i, name in enumerate(self._names) if name}
+            if not live:
+                logger.error("page_worker_pool_all_workers_dead", received=len(done), expected=expected_count)
+                return
+
+            for conn in mp_connection.wait(list(live), timeout=self._POLL_SECONDS):
+                slot = live[conn]
+                try:
+                    msg = conn.recv()
+                except (EOFError, OSError):
+                    continue  # the worker died; handled by the health check below
+                if not isinstance(msg, PageWorkResult):
+                    continue
+                self._in_flight.pop(slot, None)
+                if msg.page_number < 0:
+                    # Worker could not even start (e.g. OCR engine init failed)
+                    # and has exited; the health check below refills the slot.
+                    logger.error("page_worker_init_failed", worker=msg.worker_name, error=msg.error)
+                    continue
+                if msg.page_number not in done:
+                    done.add(msg.page_number)
+                    yield msg
+                if msg.worker_exiting and len(done) < expected_count:
+                    self._retire(slot, kill=False)
+                    logger.info("page_worker_pool_respawning", worker=msg.worker_name)
+                    self._spawn_worker(slot)
+
+            for slot, proc in enumerate(self._procs):
+                if not self._names[slot]:
+                    continue
+                started = self._in_flight.get(slot)
+                if not proc.is_alive():
+                    given_up = self._handle_lost_worker(slot, f"died (exit code {proc.exitcode})")
+                elif started is not None and time.monotonic() - started[1] > self.page_timeout_seconds:
+                    given_up = self._handle_lost_worker(slot, f"hung for over {self.page_timeout_seconds}s")
+                else:
+                    continue
+                if given_up is not None and given_up.page_number not in done:
+                    done.add(given_up.page_number)
+                    yield given_up
 
     def shutdown(self) -> None:
-        for _ in self._procs:
+        for conn in self._conns:
             try:
-                self._task_q.put(None)
-            except Exception:  # noqa: BLE001
+                conn.send(None)
+            except Exception:  # noqa: BLE001 - worker already gone
                 pass
         for proc in self._procs:
             proc.join(5)
         for proc in self._procs:
             if proc.is_alive():
                 proc.terminate()
+        for conn in self._conns:
+            try:
+                conn.close()
+            except Exception:  # noqa: BLE001
+                pass
 
     def alive_count(self) -> int:
         return sum(1 for p in self._procs if p.is_alive())

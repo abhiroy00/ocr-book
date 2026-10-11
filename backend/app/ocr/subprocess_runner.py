@@ -57,6 +57,15 @@ def _child_main(provider_name: str, task_q: "mp.Queue", result_q: "mp.Queue") ->
     takes this process down, which the parent observes via `is_alive()`."""
     import os
 
+    # Prefer this (replaceable) OCR process over the Celery process that
+    # owns the job when the OOM killer has to choose -- see
+    # `app.workers.page_worker_pool._make_oom_preferred_victim`.
+    try:
+        with open("/proc/self/oom_score_adj", "w") as f:
+            f.write("1000")
+    except OSError:
+        pass
+
     # Same defense-in-depth as `app.workers.page_worker_pool._child_main`
     # -- must happen before the OCR provider (and whatever native runtime
     # it loads) is imported below, since OpenMP/MKL/OpenBLAS read these
