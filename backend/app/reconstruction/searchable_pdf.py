@@ -268,6 +268,6 @@ def render_searchable_pdf(pages: list[tuple[np.ndarray, int, list[OCRWordResult]
     font_path = resolve_body_font_path()
     for image, dpi, words in pages:
         add_searchable_page(doc, image, dpi, words, font_path)
-    pdf_bytes = doc.tobytes(deflate=True, garbage=4)
+    pdf_bytes = doc.tobytes(deflate=True, garbage=1)  # image PDFs: see pipeline_tasks export step
     doc.close()
     return pdf_bytes

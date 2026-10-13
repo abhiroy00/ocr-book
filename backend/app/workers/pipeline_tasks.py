@@ -16,6 +16,7 @@ rather than failing the entire document (spec section 29).
 from __future__ import annotations
 
 import os
+import random
 import uuid
 
 import cv2
@@ -24,7 +25,7 @@ from celery.signals import task_failure
 
 from app.core.celery_app import celery_app
 from app.core.config import get_settings
-from app.core.locks import DOCUMENT_CANCEL_PREFIX, DOCUMENT_LOCK_PREFIX
+from app.core.locks import DOCUMENT_CANCEL_PREFIX, DOCUMENT_LOCK_PREFIX, lock_value_for_node
 from app.core.logging import get_logger, stage_timer
 from app.db.session import SessionLocal
 from app.layout.detector import LayoutDetector
@@ -74,7 +75,7 @@ def _acquire_document_lock(document_id: str) -> str | None:
     original). Self-heals via TTL if a holder dies without releasing it."""
     settings = get_settings()
     client = redis.Redis.from_url(settings.redis_url)
-    token = uuid.uuid4().hex
+    token = lock_value_for_node(settings.ocr_node_id, uuid.uuid4().hex)
     try:
         acquired = client.set(DOCUMENT_LOCK_PREFIX + document_id, token, nx=True, ex=_DOCUMENT_LOCK_TTL_SECONDS)
         return token if acquired else None
@@ -138,19 +139,35 @@ def _release_document_lock(document_id: str, token: str) -> None:
         client.close()
 
 
-@celery_app.task(bind=True, name="pipeline.process_document")
+NO_CAPACITY = "no_capacity"
+
+
+@celery_app.task(bind=True, name="pipeline.process_document", max_retries=None)
 def process_document(self, document_id: str, job_id: str) -> str:
-    return run_document_pipeline(self.request.id, document_id, job_id)
+    outcome = run_document_pipeline(self.request.id, document_id, job_id, admission_check=True)
+    if outcome == NO_CAPACITY:
+        # Same id, re-queued with a delay: the job stays QUEUED (visible as
+        # waiting, cancellable via revoke) instead of overloading the host.
+        # Jittered: two tasks that took their locks at the same instant
+        # both see "over the limit" and back off; without jitter they would
+        # keep retrying in lockstep and keep colliding.
+        base = get_settings().ocr_admission_retry_seconds
+        raise self.retry(countdown=base + random.uniform(0, base))
+    return outcome
 
 
-def run_document_pipeline(task_id: str | None, document_id: str, job_id: str, max_ocr_workers: int | None = None) -> str:
+def run_document_pipeline(
+    task_id: str | None, document_id: str, job_id: str, max_ocr_workers: int | None = None, *, admission_check: bool = False
+) -> str:
     """The whole single-document pipeline run, shared by the single-file
     task above and the multiple-file task (`app.workers.batch_tasks`) so a
     batched file goes through exactly the same code -- there is one OCR
-    implementation, not two. `max_ocr_workers` is `None` for a single-file
-    upload (behavior unchanged); a batch passes a cap only when several
-    documents run at once, so together they stay within the host's OCR
-    worker budget."""
+    implementation, not two. A batch passes `max_ocr_workers` (its claim
+    already went through `batch_scheduler.claim_next_item`'s admission). A
+    single-file upload passes `admission_check=True` instead: it is
+    admitted here, after taking its lock, against the same host-wide limit
+    (`batch_scheduler.admit_single_document`), and returns NO_CAPACITY
+    without touching the job if the host is full."""
     db = SessionLocal()
     storage = get_storage()
     lock_token = None
@@ -187,6 +204,21 @@ def run_document_pipeline(task_id: str | None, document_id: str, job_id: str, ma
                 error="Skipped: another processing run for this document was already active. Re-run to try again.",
             )
             return "duplicate_skipped"
+
+        if admission_check:
+            from app.services import batch_scheduler
+
+            provider = batch_scheduler.effective_provider(job.ocr_provider.value)
+            admission = batch_scheduler.admit_single_document(db, document_id, provider)
+            if not admission.admitted:
+                logger.info(
+                    "pipeline_waiting_for_capacity", document_id=document_id, job_id=job_id,
+                    in_use=admission.in_use, limit=admission.limit,
+                )
+                _release_document_lock(document_id, lock_token)
+                lock_token = None
+                return NO_CAPACITY
+            max_ocr_workers = admission.pool_cap
 
         job.celery_task_id = task_id
         db.commit()
@@ -312,7 +344,7 @@ def _run_pipeline(
         pool = PageWorkerPool(resolved_provider_name, document.id, original_bytes, is_pdf, job.dpi, profile, num_workers)
         try:
             pool.submit(pages_to_process)
-            for result in pool.results(len(pages_to_process)):
+            for result in pool.results(len(pages_to_process), heartbeat=lambda: _renew_document_lock(document.id, lock_token)):
                 if result.error and not result.processed_path:
                     # Worker reported a page-level failure directly (not a
                     # crash -- it already tried its own Tesseract fallback
@@ -377,10 +409,20 @@ def _run_pipeline(
     all_page_jsons = document_service.get_document_json(db, document).pages
     all_page_jsons.sort(key=lambda p: p.page_number)
 
+    # The OCR phase renews the document lock continuously (pool heartbeat),
+    # but everything below used to run without a single renewal: on a
+    # 360-page census book the reconstruct/export steps alone outlived the
+    # lock's 10-minute TTL, so the dashboard reported the still-running job
+    # as "Processing stalled" (2026-10-13) and a Retry could have started a
+    # second run of the same document alongside it.
+    def heartbeat() -> None:
+        _renew_document_lock(document.id, lock_token)
+
     clean_doc = _open_fitz_doc()
     searchable_doc = _open_fitz_doc()
     font_path = resolve_body_font_path()
     for page_json in all_page_jsons:
+        heartbeat()
         n = page_json.page_number
         processed_path = processed_path_by_page.get(n)
         if not processed_path:
@@ -406,15 +448,22 @@ def _run_pipeline(
         del processed_image
 
     document_service.update_job_progress(db, job, ProcessingStage.RECONSTRUCT, 75, DocumentStatus.RECONSTRUCTING, message="Rendering reconstructed PDF")
-    reconstructed_bytes = pdf_renderer.render_document_pdf(all_page_jsons, preserve_original=True)
+    reconstructed_bytes = pdf_renderer.render_document_pdf(all_page_jsons, preserve_original=True, on_page=heartbeat)
+    heartbeat()
 
     document_service.update_job_progress(db, job, ProcessingStage.EXPORT, 85, DocumentStatus.EXPORTING, message="Exporting PDF/DOCX/Excel")
-    clean_bytes = clean_doc.tobytes(deflate=True, garbage=4)
+    # garbage=1 (drop unused objects) instead of 4: these PDFs are page images + one
+    # embedded font, so 3/4's duplicate-object search finds nothing yet grows faster
+    # than linearly -- measured 2026-10-13: 90 pages 16.2s -> 4.5s, identical size.
+    clean_bytes = clean_doc.tobytes(deflate=True, garbage=1)
     clean_doc.close()
-    searchable_bytes = searchable_doc.tobytes(deflate=True, garbage=4)
+    searchable_bytes = searchable_doc.tobytes(deflate=True, garbage=1)
     searchable_doc.close()
+    heartbeat()
     docx_bytes = render_document_docx(all_page_jsons)
+    heartbeat()
     excel_bytes = render_document_excel(all_page_jsons, document.original_filename)
+    heartbeat()
 
     _store_export(db, storage, document, ExportType.CLEAN_PDF, f"output/{document.id}/clean.pdf", clean_bytes)
     _store_export(db, storage, document, ExportType.SEARCHABLE_PDF, f"output/{document.id}/searchable.pdf", searchable_bytes)
@@ -423,7 +472,8 @@ def _run_pipeline(
     _store_export(db, storage, document, ExportType.XLSX, f"output/{document.id}/data.xlsx", excel_bytes)
 
     document_service.update_job_progress(db, job, ProcessingStage.QUALITY, 95, DocumentStatus.EXPORTING, message="Scoring visual similarity")
-    _run_quality_pass(db, storage, document, reconstructed_bytes)
+    _run_quality_pass(db, storage, document, reconstructed_bytes, heartbeat=heartbeat)
+    heartbeat()
 
     # Library accession register (cumulative Master Excel, spec sections
     # 6-8): best-effort bibliographic-metadata extraction from the title
@@ -516,10 +566,20 @@ def _run_sequential_fallback(
     Returns True if a `/cancel` request was seen partway through."""
     layout_detector = LayoutDetector()
     ocr_worker = IsolatedOCRWorker(provider_name)
+    # One crash of the primary-engine subprocess used to switch EVERY
+    # remaining page to Tesseract for good (2026-10-08: ~160 pages of a
+    # 402-page book silently came out of Tesseract). Restart the primary
+    # engine a few times first; Tesseract stays the per-page last resort.
+    engine_restarts_left = 3
     try:
         for page_number in missing_pages:
             if _is_cancel_requested(document.id):
                 return True
+            if not ocr_worker.alive and engine_restarts_left > 0:
+                engine_restarts_left -= 1
+                logger.warning("pipeline_fallback_restarting_ocr_engine", document_id=document.id, page=page_number, restarts_left=engine_restarts_left)
+                ocr_worker.shutdown()
+                ocr_worker = IsolatedOCRWorker(provider_name)
             try:
                 rendered = render_single_page(original_bytes, is_pdf, page_number, dpi)
                 original_path = f"pages/{document.id}/page_{page_number:04d}_original.png"
@@ -633,7 +693,7 @@ def _crop_and_attach_graphic_images(
         result.image_ref = rel_path
 
 
-def _run_quality_pass(db, storage, document: Document, reconstructed_pdf_bytes: bytes) -> None:
+def _run_quality_pass(db, storage, document: Document, reconstructed_pdf_bytes: bytes, heartbeat=None) -> None:
     import fitz
 
     from app.models.document_page import DocumentPage
@@ -646,6 +706,8 @@ def _run_quality_pass(db, storage, document: Document, reconstructed_pdf_bytes: 
     recon_doc = fitz.open(stream=reconstructed_pdf_bytes, filetype="pdf")
     try:
         for page in pages:
+            if heartbeat is not None:
+                heartbeat()
             idx = page.page_number - 1
             if idx >= recon_doc.page_count or not page.processed_image_path:
                 continue

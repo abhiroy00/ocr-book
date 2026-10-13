@@ -13,6 +13,8 @@ from app.core.config import get_settings
 
 settings = get_settings()
 
+_TASK_TIME_LIMIT_SECONDS = 60 * 60 * 7
+
 celery_app = Celery(
     "document_clean_reconstruct",
     broker=settings.celery_broker_url,
@@ -62,7 +64,21 @@ celery_app.conf.update(
     # not sit at a fixed 30/40-minute limit that would kill any large job
     # partway through regardless of how well it's otherwise performing.
     task_soft_time_limit=60 * 60 * 6,
-    task_time_limit=60 * 60 * 7,
+    task_time_limit=_TASK_TIME_LIMIT_SECONDS,
+    # Must exceed task_time_limit. With `task_acks_late`, the Redis
+    # transport re-delivers any message still unacknowledged after
+    # `visibility_timeout` (default: 1 hour) -- and a pipeline task is only
+    # acked when it FINISHES, which for a large book is several hours.
+    # Reproduced (2026-10-03, visibility_timeout shortened to 60s): the
+    # still-running job was redelivered, the copy hit the document lock
+    # and marked the job FAILED mid-run (the dashboard treats FAILED as
+    # final and stopped tracking it), and on a one-slot worker the copy
+    # would instead wait and re-run the whole export phase afterwards,
+    # blocking the queue. Trade-off: a job whose worker was truly killed is
+    # now re-delivered after ~8h instead of 1h -- the UI already surfaces
+    # that case within 15 minutes via `detect_and_fail_stale_job`, and the
+    # user can retry (resume skips completed pages).
+    broker_transport_options={"visibility_timeout": _TASK_TIME_LIMIT_SECONDS + 60 * 60},
     broker_connection_retry_on_startup=True,
     # Recycle each prefork worker process after exactly one document job.
     # This was a real, confirmed production bug: a Celery prefork worker

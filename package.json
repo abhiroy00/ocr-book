@@ -1,0 +1,26 @@
+{
+  "name": "ocr-book",
+  "version": "1.0.0",
+  "description": "Turn scanned PDFs/images (old government reports, mixed Hindi/English, tables, skewed/noisy scans) into **clean, searchable, editable** documents while preserving the **original page layout** — not a plain \"OCR to text\" dump.",
+  "main": "index.js",
+  "directories": {
+    "doc": "docs"
+  },
+  "scripts": {},
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/abhiroy00/ocr-book.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "bugs": {
+    "url": "https://github.com/abhiroy00/ocr-book/issues"
+  },
+  "homepage": "https://github.com/abhiroy00/ocr-book#readme",
+  "devDependencies": {
+    "@playwright/test": "^1.64.0",
+    "@types/node": "^26.6.5"
+  }
+}

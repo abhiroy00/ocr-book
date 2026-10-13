@@ -99,6 +99,21 @@ class Settings(BaseSettings):
     # PaddleOCR itself runs cleanly in your environment.
     enable_pp_structure: bool = False
 
+    # PaddleOCR CPU inference (see app/ocr/paddle_engine.py). Measured
+    # 2026-10-12 on real pages: MKLDNN + 4 threads ~1.8x faster than the old
+    # 1 thread with identical text; 8 threads was slower and used more RAM.
+    # Keep threads x concurrent OCR workers <= available cores.
+    ocr_paddle_threads: int = 4
+    ocr_paddle_mkldnn: bool = True
+    # Mixed English/Hindi pages: "tesseract" = one English Paddle pass +
+    # Tesseract only on lines English cannot read (measured: Hindi word
+    # accuracy 95% vs 6%, ~5x faster OCR); "paddle" = old full Hindi Paddle
+    # pass merged by confidence.
+    ocr_hindi_line_engine: str = "tesseract"
+    # English-model confidence below which a line is re-read for Hindi.
+    ocr_hindi_line_confidence: float = 0.80
+    ocr_hindi_line_langs: str = "hin+eng"
+
     # --- Workers ---
     celery_worker_concurrency: int = 4
 
@@ -144,7 +159,11 @@ class Settings(BaseSettings):
     # a different PADDLE_OCR_LANGS configuration changes the real
     # per-worker footprint on your host -- and prefer a longer measurement
     # (10+ pages) over a short one: early pages undercount the true cost.
-    ocr_worker_est_memory_mb: int = 4800
+    # Re-measured 2026-10-09 on a real 402-page scanned book (150 DPI,
+    # en+hi): ~7.5GB from the second page on, then flat (peak 7538MB over
+    # 15 pages). The 4800 above came from synthetic pages; on real scans it
+    # let two documents run at once on a 12GB host and the host OOMed.
+    ocr_worker_est_memory_mb: int = 7600
     # False bypasses the RAM-aware calculation below entirely and honors
     # OCR_WORKERS literally -- an explicit escape hatch for an operator
     # who has already sized their own host. The default (True) is what
@@ -163,6 +182,15 @@ class Settings(BaseSettings):
     # for hours, infrequent enough that the model-reload cost on respawn
     # (a few seconds) stays a small fraction of total time.
     ocr_worker_max_pages: int = 25
+    # Memory ceiling (MB of RSS) for one page worker: once crossed after a
+    # page, the worker exits cleanly and the pool starts a fresh one (model
+    # reload costs seconds). 0 disables it. See `OCR_WORKER_MAX_RSS_MB` in
+    # .env.example for how the default was measured.
+    ocr_worker_max_rss_mb: int = 9000
+    # A page worker still on the SAME page after this long is treated as
+    # hung: killed, replaced, and the page retried once. Generous on
+    # purpose -- a normal page takes ~25-70s (first page also loads models).
+    ocr_page_timeout_seconds: int = 900
     # Independent, much smaller concurrency cap for NVIDIA AI-fallback
     # calls specifically -- normal OCR parallelism (OCR_WORKERS) must not
     # translate into that many simultaneous external API requests.
@@ -187,6 +215,18 @@ class Settings(BaseSettings):
     # PDF bytes + a few page buffers). Paddle uses OCR_WORKER_EST_MEMORY_MB
     # instead. Estimate; verify on your own host before relying on it.
     batch_light_engine_est_memory_mb: int = 700
+    # Identifies the OCR worker MACHINE (not container) this process runs
+    # on. Empty (default) = single-host deployment: the concurrency limit
+    # counts every running document, exactly as before. When OCR workers
+    # run on several EC2 instances (e.g. an Auto Scaling Group), set this
+    # to something unique per machine (the EC2 instance id is ideal) so
+    # each machine admits work against its own RAM/CPU instead of being
+    # blocked by documents running on a different machine. All worker
+    # containers on the same machine must share the same value.
+    ocr_node_id: str = ""
+    # How long a single-file job that found the host at its concurrency
+    # limit waits before checking again (it stays QUEUED meanwhile).
+    ocr_admission_retry_seconds: int = 20
     # Raised from 20 -- a real use case in this project's corpus is
     # uploading 60-70 books in one batch; they still process one-by-one
     # (bounded by resolved_ocr_workers/concurrency slots below, never all

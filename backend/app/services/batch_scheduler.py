@@ -38,7 +38,7 @@ from sqlalchemy import select, text
 from sqlalchemy.orm import Session
 
 from app.core.config import get_settings
-from app.core.locks import DOCUMENT_LOCK_PREFIX
+from app.core.locks import DOCUMENT_LOCK_PREFIX, lock_value_belongs_to_node
 from app.core.logging import get_logger
 from app.models.ocr_batch import OCRBatch, OCRBatchItem, BatchItemState
 
@@ -192,6 +192,23 @@ class ConcurrencyDecision:
         }
 
 
+def effective_provider(requested: str) -> str:
+    """The engine that will REALLY run (requested -> paddleocr -> tesseract,
+    same fallback chain as the pipeline), so a job that asks for an
+    unavailable NVIDIA/Ollama is admitted as the heavy Paddle job it will
+    actually become, not as a cheap remote-API job. PaddleOCR itself is not
+    probed: that would import the whole paddle runtime just to decide a
+    limit, and assuming Paddle is also the conservative choice."""
+    if requested == "paddleocr":
+        return requested
+    try:
+        from app.ocr.factory import get_ocr_provider
+
+        return get_ocr_provider(requested).name
+    except Exception:  # noqa: BLE001 - no engine at all: the pipeline will fail the file clearly; be conservative here
+        return "paddleocr"
+
+
 def _ram_fit(total_mem_mb: Optional[int], per_job_mb: int, reserved_mb: int) -> Optional[int]:
     if total_mem_mb is None:
         return None
@@ -275,28 +292,89 @@ def pool_workers_per_job(provider_name: str, concurrency: int, resources: Option
 # Admission + atomic claim
 # ----------------------------------------------------------------------------
 
-def live_pipeline_document_ids(redis_client=None) -> set[str]:
+def live_pipeline_document_ids(redis_client=None, node_id: Optional[str] = None) -> set[str]:
     """Documents that currently have a live pipeline lock. Every running
     pipeline -- single-file or batch -- holds one (see
     `pipeline_tasks._acquire_document_lock`, renewed after each page), so
     this counts *all* real work on the host, letting a batch item respect a
-    single-file upload that is already running, not only other batch items."""
+    single-file upload that is already running, not only other batch items.
+
+    With OCR_NODE_ID set, only locks taken on that same machine are counted:
+    the limit they are compared against (`resolve_concurrency`) is derived
+    from THIS machine's RAM/CPU, so documents running on another worker
+    machine must not use up this machine's slots."""
     import redis as redis_lib
 
+    node = get_settings().ocr_node_id if node_id is None else node_id
     owns_client = redis_client is None
     client = redis_client or redis_lib.Redis.from_url(get_settings().redis_url, socket_connect_timeout=5, socket_timeout=5)
     try:
         prefix = DOCUMENT_LOCK_PREFIX
-        return {
-            (k.decode() if isinstance(k, bytes) else k)[len(prefix):]
-            for k in client.scan_iter(match=prefix + "*", count=100)
-        }
+        keys = [k.decode() if isinstance(k, bytes) else k for k in client.scan_iter(match=prefix + "*", count=100)]
+        if node and keys:
+            values = client.mget(keys)
+            keys = [k for k, v in zip(keys, values) if lock_value_belongs_to_node(v, node)]
+        return {k[len(prefix):] for k in keys}
     except redis_lib.exceptions.RedisError as exc:
         logger.warning("batch_live_lock_scan_failed", error=str(exc))
         return set()
     finally:
         if owns_client:
             client.close()
+
+
+def documents_in_use(db: Session, redis_client=None, now: Optional[datetime] = None) -> set[str]:
+    """Everything currently doing OCR on this host: live pipeline locks,
+    plus batch items claimed a moment ago that haven't taken their lock yet
+    (see CLAIM_GRACE_SECONDS)."""
+    now = now or datetime.now(timezone.utc)
+    live_docs = live_pipeline_document_ids(redis_client)
+    grace_cutoff = now - timedelta(seconds=CLAIM_GRACE_SECONDS)
+    recently_claimed = db.scalars(
+        select(OCRBatchItem.document_id).where(
+            OCRBatchItem.state == BatchItemState.RUNNING.value, OCRBatchItem.claimed_at >= grace_cutoff
+        )
+    ).all()
+    return live_docs | set(recently_claimed)
+
+
+@dataclass(frozen=True)
+class Admission:
+    admitted: bool
+    in_use: int
+    limit: int
+    pool_cap: Optional[int]
+
+
+def admit_single_document(
+    db: Session,
+    document_id: str,
+    provider_name: str,
+    *,
+    redis_client=None,
+    resources: Optional[HostResources] = None,
+) -> Admission:
+    """Capacity check for a single-file upload, called AFTER that document
+    has taken its own pipeline lock (so it is already counted in `in_use`,
+    and two tasks starting at the same instant both see each other).
+
+    Single-file jobs used to skip admission entirely: their only bound was
+    the Celery worker's --concurrency, so with OCR_MAX_CONCURRENCY above
+    what the RAM really fits (or alongside a running batch) each document
+    sized its PaddleOCR pool from whatever RAM happened to be free at that
+    moment and still started a ~4.8GB worker with ~2.3GB available (seen in
+    the worker log: `available_ram_mb=2332 chosen=1`). Now a single-file
+    document waits (stays QUEUED) until the host has room, exactly like a
+    batch item, and gets the same per-document pool cap."""
+    decision = resolve_concurrency(provider_name, resources)
+    in_use = documents_in_use(db, redis_client)
+    in_use.add(document_id)
+    return Admission(
+        admitted=len(in_use) <= decision.limit,
+        in_use=len(in_use),
+        limit=decision.limit,
+        pool_cap=pool_workers_per_job(provider_name, decision.limit, resources),
+    )
 
 
 def _serialize_claims(db: Session) -> None:
@@ -355,14 +433,7 @@ def claim_next_item(
 
     # Everything currently doing OCR on this host: live pipeline locks, plus
     # anything claimed a moment ago that hasn't taken its lock yet.
-    live_docs = live_pipeline_document_ids(redis_client)
-    grace_cutoff = now - timedelta(seconds=CLAIM_GRACE_SECONDS)
-    recently_claimed = db.scalars(
-        select(OCRBatchItem.document_id).where(
-            OCRBatchItem.state == BatchItemState.RUNNING.value, OCRBatchItem.claimed_at >= grace_cutoff
-        )
-    ).all()
-    in_use = len(live_docs | set(recently_claimed))
+    in_use = len(documents_in_use(db, redis_client, now))
     if in_use >= decision.limit:
         db.rollback()
         return ClaimOutcome.NO_CAPACITY, None

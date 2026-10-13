@@ -59,6 +59,6 @@ def render_clean_pdf(pages: list[tuple[np.ndarray, int, list]]) -> bytes:
     doc = fitz.open()
     for image, dpi, words in pages:
         add_clean_page(doc, image, dpi, words)
-    pdf_bytes = doc.tobytes(deflate=True, garbage=4)
+    pdf_bytes = doc.tobytes(deflate=True, garbage=1)  # image PDFs: see pipeline_tasks export step
     doc.close()
     return pdf_bytes

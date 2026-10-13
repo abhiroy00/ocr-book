@@ -109,3 +109,114 @@ def test_pool_recycles_a_worker_after_its_page_quota_and_keeps_processing():
     # actually distinguishes "the same process kept running" from
     # "an old process exited and a new one took its place".
     assert pool._procs[0].pid != original_pid
+
+
+# ---------------------------------------------------------------------------
+# Self-healing (2026-10-08: a 402-page book stalled after an OOM killed its
+# page workers -- the pool neither replaced them nor re-queued their pages,
+# and a hung worker blocked another document for 40 minutes).
+# ---------------------------------------------------------------------------
+
+import os
+import time
+
+import pytest
+
+import app.services.pdf_ingest as pdf_ingest
+
+
+def _sabotage_page(monkeypatch, tmp_path, page: int, action: str, times: int = 1):
+    """Make `render_single_page` misbehave for `page` the first `times`
+    times it is attempted (counted across processes via a marker file --
+    pool workers are forked, so the patch reaches them)."""
+    real = pdf_ingest.render_single_page
+    counter = tmp_path / f"attempts_{page}"
+
+    def patched(file_bytes, is_pdf, page_number, dpi):
+        if page_number == page:
+            n = int(counter.read_text()) if counter.exists() else 0
+            counter.write_text(str(n + 1))
+            if n < times:
+                if action == "die":
+                    os._exit(137)  # like an OOM kill: no cleanup, no result
+                if action == "hang":
+                    time.sleep(600)
+        return real(file_bytes, is_pdf, page_number, dpi)
+
+    monkeypatch.setattr(pdf_ingest, "render_single_page", patched)
+    return counter
+
+
+def test_pool_replaces_a_worker_killed_mid_page_and_retries_that_page(monkeypatch, tmp_path):
+    counter = _sabotage_page(monkeypatch, tmp_path, page=2, action="die")
+    pool = PageWorkerPool("tesseract", "test-doc-f", _make_pdf_bytes(4), True, 150, PreprocessProfile.FAST, num_workers=2)
+    try:
+        pool.submit([1, 2, 3, 4])
+        results = {r.page_number: r for r in pool.results(4)}
+    finally:
+        pool.shutdown()
+
+    assert set(results) == {1, 2, 3, 4}
+    assert all(r.error is None for r in results.values())  # page 2 succeeded on its retry
+    assert counter.read_text() == "2"
+
+
+def test_pool_kills_and_replaces_a_hung_worker(monkeypatch, tmp_path):
+    _sabotage_page(monkeypatch, tmp_path, page=1, action="hang")
+    pool = PageWorkerPool(
+        "tesseract", "test-doc-g", _make_pdf_bytes(2), True, 150, PreprocessProfile.FAST, num_workers=1, page_timeout_seconds=3,
+    )
+    started = time.monotonic()
+    try:
+        pool.submit([1, 2])
+        results = {r.page_number: r for r in pool.results(2)}
+    finally:
+        pool.shutdown()
+
+    assert set(results) == {1, 2} and all(r.error is None for r in results.values())
+    assert time.monotonic() - started < 120  # not the 600s the hang would have taken
+
+
+def test_pool_gives_up_on_a_page_that_keeps_killing_workers(monkeypatch, tmp_path):
+    _sabotage_page(monkeypatch, tmp_path, page=2, action="die", times=99)
+    pool = PageWorkerPool("tesseract", "test-doc-h", _make_pdf_bytes(3), True, 150, PreprocessProfile.FAST, num_workers=1)
+    try:
+        pool.submit([1, 2, 3])
+        results = {r.page_number: r for r in pool.results(3)}
+    finally:
+        pool.shutdown()
+
+    assert set(results) == {1, 2, 3}
+    assert results[2].error and not results[2].processed_path  # handed to the pipeline's sequential sweep
+    assert results[1].error is None and results[3].error is None  # the other pages were not lost
+
+
+def test_pool_recycles_a_worker_that_crosses_the_memory_ceiling():
+    pool = PageWorkerPool(
+        "tesseract", "test-doc-i", _make_pdf_bytes(3), True, 150, PreprocessProfile.FAST, num_workers=1, max_rss_mb=1,
+    )
+    first_pid = pool._procs[0].pid
+    try:
+        pool.submit([1, 2, 3])
+        results = list(pool.results(3))
+    finally:
+        pool.shutdown()
+
+    assert sorted(r.page_number for r in results) == [1, 2, 3] and all(r.error is None for r in results)
+    assert pool._procs[0].pid != first_pid
+    assert sum(r.worker_exiting for r in results) >= 2  # every page crossed a 1MB ceiling
+
+
+def test_pool_calls_heartbeat_while_waiting(monkeypatch, tmp_path):
+    _sabotage_page(monkeypatch, tmp_path, page=1, action="hang")
+    beats = []
+    pool = PageWorkerPool(
+        "tesseract", "test-doc-j", _make_pdf_bytes(1), True, 150, PreprocessProfile.FAST, num_workers=1, page_timeout_seconds=12,
+    )
+    try:
+        pool.submit([1])
+        list(pool.results(1, heartbeat=lambda: beats.append(time.monotonic())))
+    finally:
+        pool.shutdown()
+
+    assert len(beats) >= 2  # kept the document lock alive during the slow page
