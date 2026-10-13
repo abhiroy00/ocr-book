@@ -1,16 +1,17 @@
 """
 PaddleOCR provider — the default, offline, no-API-key OCR engine.
 
-PaddleOCR's recognizer is per-language (a "lang" model bundle). For
-Hindi+English mixed pages we run one detector+recognizer pass per configured
-language (default `en` + `hi` from PADDLE_OCR_LANGS) over the *same* image
-and merge results at the region level: for overlapping detections we keep
-the higher-confidence recognition; non-overlapping detections from either
-pass are both kept. This is a practical way to cover mixed-script pages
-without a single joint multilingual recognizer.
+PaddleOCR's recognizer is per-language (a "lang" model bundle). With the
+default PADDLE_OCR_LANGS=en,hi and OCR_HINDI_LINE_ENGINE=tesseract, a page
+gets ONE English PaddleOCR pass, and only the lines the English model cannot
+read go to Tesseract (hin+eng) -- see `_recognize_english_with_hindi_lines`
+for the measurements behind this. Any other language set (or
+OCR_HINDI_LINE_ENGINE=paddle) keeps the original behaviour: one full pass per
+language over the same image, merged per region by confidence.
 """
 from __future__ import annotations
 
+import re
 import threading
 
 import numpy as np
@@ -46,6 +47,14 @@ def _get_paddle_engine(lang: str):
     parallelism (one process per `OCR_WORKERS`) the sole source of
     concurrency, which is the correct place for it: no oversubscription is
     possible regardless of how many pool workers are configured.
+
+    Revisited 2026-10-12 with measurements: real scanned books need ~7.8GB
+    per worker, so on the 12GB host only ONE pool worker ever runs -- and at
+    1 thread that left 13 of 14 cores idle. Thread count and MKLDNN are now
+    settings (`OCR_PADDLE_THREADS`, `OCR_PADDLE_MKLDNN`). Measured on 8 real
+    pages: MKLDNN + 4 threads made the English pass ~1.8x faster (3.6s ->
+    2.0s/page) with identical output; 8 threads was slower and used more
+    memory. Keep threads x OCR workers <= the cores you really have.
     """
     with _engine_lock:
         if lang not in _engine_cache:
@@ -53,7 +62,11 @@ def _get_paddle_engine(lang: str):
                 from paddleocr import PaddleOCR
             except ImportError as exc:  # pragma: no cover - environment dependent
                 raise OCREngineUnavailableError(f"paddleocr package not installed: {exc}") from exc
-            _engine_cache[lang] = PaddleOCR(use_angle_cls=True, lang=lang, show_log=False, cpu_threads=1)
+            settings = get_settings()
+            _engine_cache[lang] = PaddleOCR(
+                use_angle_cls=True, lang=lang, show_log=False,
+                cpu_threads=max(1, settings.ocr_paddle_threads), enable_mkldnn=settings.ocr_paddle_mkldnn,
+            )
         return _engine_cache[lang]
 
 
@@ -76,13 +89,61 @@ class PaddleOCREngine(OCRProvider):
         if not self.is_available():
             raise OCREngineUnavailableError("PaddleOCR is not installed in this environment")
 
+        if "en" in self.langs and "hi" in self.langs and get_settings().ocr_hindi_line_engine == "tesseract":
+            return self._recognize_english_with_hindi_lines(image, page_number, dpi)
+
         all_words: list[OCRWordResult] = []
         for lang in self.langs:
             engine = _get_paddle_engine(_map_lang(lang))
             raw = engine.ocr(image, cls=True)
             words = _parse_paddle_result(raw, page_number, dpi, lang)
             all_words = _merge_by_iou(all_words, words)
+        return self._finalize(all_words, page_number)
 
+    def _recognize_english_with_hindi_lines(self, image: np.ndarray, page_number: int, dpi: int) -> OCRPageResult:
+        """English PaddleOCR on the whole page, then Tesseract (hin+eng) on
+        ONLY the lines the English model could not read. Replaces running a
+        full Hindi Paddle pass on every page and merging by confidence.
+
+        Why (measured 2026-10-12, real 402-page book + known-text pages):
+          * the confidence merge let the Hindi model's output win on plain
+            ENGLISH lines -- real pages came out as "t० the state", "s०
+            distant", "Ieft Iargely" -- while the English model alone read
+            the same lines correctly;
+          * Paddle's Devanagari models (PP-OCRv4 and v3) broke conjuncts and
+            dropped spaces: ~26% Hindi character error, ~6% of Hindi words
+            exact; Tesseract `hin` on the same lines: 2.8% / 95%;
+          * the full Hindi pass cost ~12s of a ~17s page; this path is ~3s.
+        A Tesseract result replaces the English one only when it really is
+        mostly Devanagari, so an English line can never be swapped for
+        Latin guesses from the second engine."""
+        engine = _get_paddle_engine("en")
+        raw = engine.ocr(image, cls=True)
+        lines = raw[0] if isinstance(raw, list) and len(raw) == 1 and isinstance(raw[0], list) else raw
+        words: list[OCRWordResult] = []
+        for i, item in enumerate(lines or []):
+            try:
+                box_pts, (text, confidence) = item
+            except (TypeError, ValueError):
+                continue
+            if _looks_unreadable_as_english(text, float(confidence)):
+                hindi_text, hindi_conf = _tesseract_line(image, box_pts)
+                if _is_mostly_devanagari(hindi_text):
+                    text, confidence = hindi_text, hindi_conf
+            if not text or not text.strip():
+                continue
+            polygon = Polygon.from_xy_list(box_pts)
+            bbox = polygon.bbox()
+            words.append(
+                OCRWordResult(
+                    text=text, confidence=float(confidence), bbox=bbox, polygon=polygon, page_number=page_number,
+                    block_id=f"blk_{i:05d}", line_id=f"ln_{i:05d}", word_id=None,
+                    language=detect_language(text) or "en", font_size_estimate=_estimate_font_size(bbox, dpi),
+                )
+            )
+        return self._finalize(words, page_number)
+
+    def _finalize(self, all_words: list[OCRWordResult], page_number: int) -> OCRPageResult:
         # Assign stable block/line ids grouped by reading order (top-to-bottom).
         all_words.sort(key=lambda w: (round(w.bbox.y1 / 10), w.bbox.x1))
         for idx, w in enumerate(all_words):
@@ -91,6 +152,44 @@ class PaddleOCREngine(OCRProvider):
 
         mean_conf = float(np.mean([w.confidence for w in all_words])) if all_words else 0.0
         return OCRPageResult(page_number=page_number, provider=self.name, words=all_words, mean_confidence=mean_conf)
+
+
+_DEVANAGARI = re.compile(r"[ऀ-ॿ]")
+_LATIN_WORD = re.compile(r"[A-Za-z]+")
+
+
+def _looks_unreadable_as_english(text: str, confidence: float) -> bool:
+    """The English model is unsure, or produced the letter fragments it
+    typically emits when it is shown Devanagari."""
+    if confidence < get_settings().ocr_hindi_line_confidence:
+        return True
+    latin_words = _LATIN_WORD.findall(text)
+    return bool(latin_words) and sum(len(w) for w in latin_words) / len(latin_words) < 2.0
+
+
+def _is_mostly_devanagari(text: str) -> bool:
+    chars = re.sub(r"\s", "", text or "")
+    return bool(chars) and len(_DEVANAGARI.findall(chars)) >= 0.5 * len(chars)
+
+
+def _tesseract_line(image: np.ndarray, box_pts) -> tuple[str, float]:
+    """Single-line Tesseract (hin+eng) on the detected line's crop. Never
+    raises: an unavailable/failing Tesseract just keeps the English result."""
+    try:
+        import pytesseract
+        from paddleocr.tools.infer.utility import get_rotate_crop_image
+
+        settings = get_settings()
+        if settings.tesseract_path:
+            pytesseract.pytesseract.tesseract_cmd = settings.tesseract_path
+        crop = get_rotate_crop_image(image, np.array(box_pts, dtype=np.float32))
+        data = pytesseract.image_to_data(crop, lang=settings.ocr_hindi_line_langs, config="--psm 7", output_type=pytesseract.Output.DICT)
+        tokens = [(w, float(c)) for w, c in zip(data["text"], data["conf"]) if w and w.strip() and float(c) >= 0]
+        if not tokens:
+            return "", 0.0
+        return " ".join(w for w, _ in tokens), sum(c for _, c in tokens) / len(tokens) / 100.0
+    except Exception:  # noqa: BLE001 - the English result stands
+        return "", 0.0
 
 
 def _map_lang(lang: str) -> str:

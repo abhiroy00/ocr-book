@@ -851,9 +851,12 @@ def rebuild_image_based_exports(db: Session, storage, document: Document) -> dic
         clean_pdf.add_clean_page(clean_doc, image, page.dpi)
         searchable_pdf.add_searchable_page(searchable_doc, image, page.dpi, words, font_path, extra_content_boxes=extra_boxes)
 
-    clean_bytes = clean_doc.tobytes(deflate=True, garbage=4)
+    # garbage=1 (drop unused objects) instead of 4: these PDFs are page images + one
+    # embedded font, so 3/4's duplicate-object search finds nothing yet grows faster
+    # than linearly -- measured 2026-10-13: 90 pages 16.2s -> 4.5s, identical size.
+    clean_bytes = clean_doc.tobytes(deflate=True, garbage=1)
     clean_doc.close()
-    searchable_bytes = searchable_doc.tobytes(deflate=True, garbage=4)
+    searchable_bytes = searchable_doc.tobytes(deflate=True, garbage=1)
     searchable_doc.close()
 
     storage.write(f"output/{document.id}/clean.pdf", clean_bytes)

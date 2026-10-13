@@ -170,6 +170,14 @@ def _child_main(
     # what any dependency's own default would otherwise pick.
     for _env_var in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS", "NUMEXPR_NUM_THREADS", "VECLIB_MAXIMUM_THREADS"):
         os.environ.setdefault(_env_var, "1")
+    if provider_name == "paddleocr":
+        # PaddleOCR's own MKLDNN/MKL thread pool is the one place this worker
+        # deliberately uses several threads (OCR_PADDLE_THREADS): with only
+        # one worker fitting in RAM on this host, a 1-thread cap left 13 of
+        # 14 cores idle. Everything else above stays at 1.
+        _paddle_threads = str(max(1, get_settings().ocr_paddle_threads))
+        os.environ["OMP_NUM_THREADS"] = _paddle_threads
+        os.environ["MKL_NUM_THREADS"] = _paddle_threads
 
     import cv2
 

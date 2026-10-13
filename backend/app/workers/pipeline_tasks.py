@@ -409,10 +409,20 @@ def _run_pipeline(
     all_page_jsons = document_service.get_document_json(db, document).pages
     all_page_jsons.sort(key=lambda p: p.page_number)
 
+    # The OCR phase renews the document lock continuously (pool heartbeat),
+    # but everything below used to run without a single renewal: on a
+    # 360-page census book the reconstruct/export steps alone outlived the
+    # lock's 10-minute TTL, so the dashboard reported the still-running job
+    # as "Processing stalled" (2026-10-13) and a Retry could have started a
+    # second run of the same document alongside it.
+    def heartbeat() -> None:
+        _renew_document_lock(document.id, lock_token)
+
     clean_doc = _open_fitz_doc()
     searchable_doc = _open_fitz_doc()
     font_path = resolve_body_font_path()
     for page_json in all_page_jsons:
+        heartbeat()
         n = page_json.page_number
         processed_path = processed_path_by_page.get(n)
         if not processed_path:
@@ -438,15 +448,22 @@ def _run_pipeline(
         del processed_image
 
     document_service.update_job_progress(db, job, ProcessingStage.RECONSTRUCT, 75, DocumentStatus.RECONSTRUCTING, message="Rendering reconstructed PDF")
-    reconstructed_bytes = pdf_renderer.render_document_pdf(all_page_jsons, preserve_original=True)
+    reconstructed_bytes = pdf_renderer.render_document_pdf(all_page_jsons, preserve_original=True, on_page=heartbeat)
+    heartbeat()
 
     document_service.update_job_progress(db, job, ProcessingStage.EXPORT, 85, DocumentStatus.EXPORTING, message="Exporting PDF/DOCX/Excel")
-    clean_bytes = clean_doc.tobytes(deflate=True, garbage=4)
+    # garbage=1 (drop unused objects) instead of 4: these PDFs are page images + one
+    # embedded font, so 3/4's duplicate-object search finds nothing yet grows faster
+    # than linearly -- measured 2026-10-13: 90 pages 16.2s -> 4.5s, identical size.
+    clean_bytes = clean_doc.tobytes(deflate=True, garbage=1)
     clean_doc.close()
-    searchable_bytes = searchable_doc.tobytes(deflate=True, garbage=4)
+    searchable_bytes = searchable_doc.tobytes(deflate=True, garbage=1)
     searchable_doc.close()
+    heartbeat()
     docx_bytes = render_document_docx(all_page_jsons)
+    heartbeat()
     excel_bytes = render_document_excel(all_page_jsons, document.original_filename)
+    heartbeat()
 
     _store_export(db, storage, document, ExportType.CLEAN_PDF, f"output/{document.id}/clean.pdf", clean_bytes)
     _store_export(db, storage, document, ExportType.SEARCHABLE_PDF, f"output/{document.id}/searchable.pdf", searchable_bytes)
@@ -455,7 +472,8 @@ def _run_pipeline(
     _store_export(db, storage, document, ExportType.XLSX, f"output/{document.id}/data.xlsx", excel_bytes)
 
     document_service.update_job_progress(db, job, ProcessingStage.QUALITY, 95, DocumentStatus.EXPORTING, message="Scoring visual similarity")
-    _run_quality_pass(db, storage, document, reconstructed_bytes)
+    _run_quality_pass(db, storage, document, reconstructed_bytes, heartbeat=heartbeat)
+    heartbeat()
 
     # Library accession register (cumulative Master Excel, spec sections
     # 6-8): best-effort bibliographic-metadata extraction from the title
@@ -675,7 +693,7 @@ def _crop_and_attach_graphic_images(
         result.image_ref = rel_path
 
 
-def _run_quality_pass(db, storage, document: Document, reconstructed_pdf_bytes: bytes) -> None:
+def _run_quality_pass(db, storage, document: Document, reconstructed_pdf_bytes: bytes, heartbeat=None) -> None:
     import fitz
 
     from app.models.document_page import DocumentPage
@@ -688,6 +706,8 @@ def _run_quality_pass(db, storage, document: Document, reconstructed_pdf_bytes: 
     recon_doc = fitz.open(stream=reconstructed_pdf_bytes, filetype="pdf")
     try:
         for page in pages:
+            if heartbeat is not None:
+                heartbeat()
             idx = page.page_number - 1
             if idx >= recon_doc.page_count or not page.processed_image_path:
                 continue

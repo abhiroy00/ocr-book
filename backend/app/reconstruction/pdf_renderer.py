@@ -44,7 +44,7 @@ _IMAGE_BLOCK_TYPES = {
 }
 
 
-def render_document_pdf(pages: list[PageJSON], preserve_original: bool | None = None) -> bytes:
+def render_document_pdf(pages: list[PageJSON], preserve_original: bool | None = None, on_page=None) -> bytes:
     """Render all pages as PDF.
 
     If preserve_original is True (default), output pages preserve the
@@ -66,6 +66,8 @@ def render_document_pdf(pages: list[PageJSON], preserve_original: bool | None = 
     bold_font = resolve_body_font_path(bold=True) or body_font
 
     for page_json in pages:
+        if on_page is not None:
+            on_page()  # e.g. renew the pipeline's document lock on long documents
         if preserve_original:
             # Preserve original page dimensions - do NOT normalize to A4
             a4_width_pt, a4_height_pt = page_json.page_width, page_json.page_height
@@ -199,10 +201,17 @@ def _render_text(page, rect: "fitz.Rect", block: DocumentBlockJSON,
     if remainder < 0:
         # Text didn't fit the box at this size — shrink until it fits or we
         # hit a sane minimum, rather than silently truncating content.
+        # Same candidate sizes as the old one-step-at-a-time loop (0.5pt
+        # steps down to ~5pt), but found by `_largest_fitting_size` on a
+        # throwaway shape and written to the page only once -- see there.
+        candidates = []
         size = fontsize
-        while remainder < 0 and size > 5:
+        while size > 5:
             size -= 0.5
-            kwargs["fontsize"] = size
+            candidates.append(size)
+        best = _largest_fitting_size(page, rect, text, kwargs, candidates)
+        if best is not None:
+            kwargs["fontsize"] = best
             remainder = page.insert_textbox(rect, text, **kwargs)
 
     if remainder < 0:
@@ -212,6 +221,35 @@ def _render_text(page, rect: "fitz.Rect", block: DocumentBlockJSON,
         # the data entirely.
         kwargs["fontsize"] = 2.5
         page.insert_textbox(rect, text, **kwargs)
+
+
+def _largest_fitting_size(page, rect: "fitz.Rect", text: str, kwargs: dict, candidates: list[float]) -> float | None:
+    """The largest of `candidates` (descending font sizes) at which `text`
+    fits `rect`, or None if none does.
+
+    Replaces trying every size directly on the page: each `page.insert_textbox`
+    builds a new Shape, inserts the font and commits a content stream, and
+    the old loops made ~12 such calls per block on dense pages. Profiled
+    2026-10-13 on a real 360-page census book: 27,742 calls for 2,345 blocks
+    in 15 pages, the whole reconstructed-PDF step taking 10+ minutes. Trials
+    now run on ONE throwaway shape that is never committed (a size that does
+    not fit writes nothing), with a binary search over the same 0.5pt grid --
+    smaller text never fits worse, so it picks the same size the linear loop
+    did. The caller then writes to the page once."""
+    if not candidates:
+        return None
+    scratch = page.new_shape()
+    trial = dict(kwargs)
+    lo, hi, best = 0, len(candidates) - 1, None
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        trial["fontsize"] = candidates[mid]
+        if scratch.insert_textbox(rect, text, **trial) >= 0:
+            best = candidates[mid]
+            hi = mid - 1  # fits: try a larger size (lower index)
+        else:
+            lo = mid + 1
+    return best
 
 
 def _default_font_size(block_type: LayoutBlockType) -> float:
@@ -246,6 +284,10 @@ def _render_table(page, block: DocumentBlockJSON, page_json: PageJSON, body_font
     table = block.table
     dpi = page_json.dpi
 
+    # All cell borders go into ONE shape committed once per table, instead of
+    # one `page.draw_rect` (a whole shape + content-stream commit) per cell.
+    cells = []
+    borders = page.new_shape()
     for row in table.rows:
         for cell in row.cells:
             # Transform cell bbox to A4 coordinates
@@ -253,38 +295,50 @@ def _render_table(page, block: DocumentBlockJSON, page_json: PageJSON, body_font
             cell_rect = fitz.Rect(
                 a4_cell_bbox.x1, a4_cell_bbox.y1, a4_cell_bbox.x2, a4_cell_bbox.y2,
             )
-            page.draw_rect(cell_rect, color=(0, 0, 0), width=0.6)
-            if not cell.text.strip():
-                continue
+            borders.draw_rect(cell_rect)
+            cells.append((cell, cell_rect))
+    borders.finish(color=(0, 0, 0), width=0.6)
+    borders.commit()
 
-            align = _ALIGN_MAP.get(cell.align_h, fitz.TEXT_ALIGN_LEFT)
-            kwargs = {"align": align, "color": (0, 0, 0)}
-            if body_font:
-                kwargs["fontfile"] = body_font
-                kwargs["fontname"] = "F0"
-            else:
-                kwargs["fontname"] = "helv"
+    for cell, cell_rect in cells:
+        if not cell.text.strip():
+            continue
 
-            # Scale font based on cell height in A4 coordinates
-            pad = min(2.0, max(0.0, cell_rect.height * 0.15))
-            inset = cell_rect + (pad, pad, -pad, -pad)
-            if inset.width <= 0 or inset.height <= 0:
-                inset = cell_rect
+        align = _ALIGN_MAP.get(cell.align_h, fitz.TEXT_ALIGN_LEFT)
+        kwargs = {"align": align, "color": (0, 0, 0)}
+        if body_font:
+            kwargs["fontfile"] = body_font
+            kwargs["fontname"] = "F0"
+        else:
+            kwargs["fontname"] = "helv"
 
-            fontsize = min(9.0, max(3.0, inset.height * 0.85))
-            remainder = -1.0
-            while remainder < 0 and fontsize > 2.5:
-                kwargs["fontsize"] = fontsize
+        # Scale font based on cell height in A4 coordinates
+        pad = min(2.0, max(0.0, cell_rect.height * 0.15))
+        inset = cell_rect + (pad, pad, -pad, -pad)
+        if inset.width <= 0 or inset.height <= 0:
+            inset = cell_rect
+
+        fontsize = min(9.0, max(3.0, inset.height * 0.85))
+        kwargs["fontsize"] = fontsize
+        remainder = page.insert_textbox(inset, cell.text, **kwargs)
+        if remainder < 0:
+            candidates = []
+            size = fontsize - 0.5
+            while size > 2.5:
+                candidates.append(size)
+                size -= 0.5
+            best = _largest_fitting_size(page, inset, cell.text, kwargs, candidates)
+            if best is not None:
+                kwargs["fontsize"] = best
                 remainder = page.insert_textbox(inset, cell.text, **kwargs)
-                fontsize -= 0.5
 
-            if remainder < 0:
-                # Still doesn't fit even at the smallest legible size --
-                # insert anyway (unpadded, at the floor size) rather than
-                # silently dropping real content; a hairline overflow is a
-                # far smaller defect than losing the data entirely.
-                kwargs["fontsize"] = 2.5
-                page.insert_textbox(cell_rect, cell.text, **kwargs)
+        if remainder < 0:
+            # Still doesn't fit even at the smallest legible size --
+            # insert anyway (unpadded, at the floor size) rather than
+            # silently dropping real content; a hairline overflow is a
+            # far smaller defect than losing the data entirely.
+            kwargs["fontsize"] = 2.5
+            page.insert_textbox(cell_rect, cell.text, **kwargs)
 
 
 def _transform_bbox_to_a4(cell_bbox, dpi, page_width, page_height):

@@ -99,6 +99,21 @@ class Settings(BaseSettings):
     # PaddleOCR itself runs cleanly in your environment.
     enable_pp_structure: bool = False
 
+    # PaddleOCR CPU inference (see app/ocr/paddle_engine.py). Measured
+    # 2026-10-12 on real pages: MKLDNN + 4 threads ~1.8x faster than the old
+    # 1 thread with identical text; 8 threads was slower and used more RAM.
+    # Keep threads x concurrent OCR workers <= available cores.
+    ocr_paddle_threads: int = 4
+    ocr_paddle_mkldnn: bool = True
+    # Mixed English/Hindi pages: "tesseract" = one English Paddle pass +
+    # Tesseract only on lines English cannot read (measured: Hindi word
+    # accuracy 95% vs 6%, ~5x faster OCR); "paddle" = old full Hindi Paddle
+    # pass merged by confidence.
+    ocr_hindi_line_engine: str = "tesseract"
+    # English-model confidence below which a line is re-read for Hindi.
+    ocr_hindi_line_confidence: float = 0.80
+    ocr_hindi_line_langs: str = "hin+eng"
+
     # --- Workers ---
     celery_worker_concurrency: int = 4
 
